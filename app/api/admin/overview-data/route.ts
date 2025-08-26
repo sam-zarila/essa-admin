@@ -15,9 +15,9 @@ type Loan = {
   mobile?: string;
   loanAmount?: number;
   currentBalance?: number;
-  loanPeriod?: number;            // months or weeks (see paymentFrequency)
+  loanPeriod?: number;
   paymentFrequency?: "weekly" | "monthly";
-  status?: string;                // pending | approved | rejected | closed | finished
+  status?: string;
   timestamp?: admin.firestore.Timestamp | null;
   areaName?: string;
   collateralItems?: Array<{ description?: string }>;
@@ -40,13 +40,20 @@ function computeEndDate(
 }
 
 export async function GET() {
-  const session = cookies().get("__session")?.value;
-  if (!session) return NextResponse.json({ error: "unauthenticated" }, { status: 401 });
+  // ✅ FIX: await cookies() inside a Route Handler
+  const cookieStore = await cookies();
+  const session = cookieStore.get("__session")?.value;
+
+  if (!session) {
+    return NextResponse.json({ error: "unauthenticated" }, { status: 401 });
+  }
 
   try {
     const decoded = await adminAuth().verifySessionCookie(session, true);
     const claims = decoded as any;
-    if (!claims.admin && !claims.officer) return NextResponse.json({ error: "forbidden" }, { status: 403 });
+    if (!claims.admin && !claims.officer) {
+      return NextResponse.json({ error: "forbidden" }, { status: 403 });
+    }
 
     const db = adminDb();
 
@@ -84,14 +91,12 @@ export async function GET() {
       return { ...r, endDate };
     });
 
-    // Outstanding = approved with positive balance
     const outstanding = withDerived
       .filter((r) => r.status === "approved" && (r.currentBalance ?? 0) > 0)
       .sort((a, b) => (b.currentBalance ?? 0) - (a.currentBalance ?? 0));
 
     const outstandingTop = outstanding.slice(0, 6);
 
-    // Upcoming deadlines: approved, balance >0, endDate within next 14 days
     const deadlinesUpcoming = withDerived
       .filter(
         (r) =>
@@ -101,10 +106,9 @@ export async function GET() {
           r.endDate >= now &&
           r.endDate <= soon
       )
-      .sort((a, b) => (a.endDate!.getTime() - b.endDate!.getTime()))
+      .sort((a, b) => a.endDate!.getTime() - b.endDate!.getTime())
       .slice(0, 8);
 
-    // Overdue + with collateral
     const overdueWithCollateral = withDerived
       .filter(
         (r) =>
@@ -114,10 +118,9 @@ export async function GET() {
           r.endDate < now &&
           (r.collateralItems?.length ?? 0) > 0
       )
-      .sort((a, b) => (a.endDate!.getTime() - b.endDate!.getTime()))
+      .sort((a, b) => a.endDate!.getTime() - b.endDate!.getTime())
       .slice(0, 8);
 
-    // Finished repayments: zero balance or status marked closed/finished
     const finished = withDerived
       .filter(
         (r) =>
@@ -127,11 +130,15 @@ export async function GET() {
       )
       .slice(0, 8);
 
-    // Recent applicants (latest submissions regardless of status)
     const recentApplicants = withDerived.slice(0, 8);
 
-    // KYC to review: kyc_data where kycCompleted == false (if you store it)
-    let kycPending: Array<{ id: string; firstName?: string; lastName?: string; mobile?: string; createdAt?: number | null }> = [];
+    let kycPending: Array<{
+      id: string;
+      firstName?: string;
+      lastName?: string;
+      mobile?: string;
+      createdAt?: number | null;
+    }> = [];
     try {
       const kycSnap = await db.collection("kyc_data").where("kycCompleted", "==", false).limit(10).get();
       kycPending = kycSnap.docs.map((d) => {
@@ -145,11 +152,9 @@ export async function GET() {
         };
       });
     } catch {
-      // If the field doesn't exist, just return an empty list
       kycPending = [];
     }
 
-    // Totals
     const totals = {
       outstandingCount: outstanding.length,
       outstandingBalanceSum: outstanding.reduce((s, r) => s + (r.currentBalance || 0), 0),

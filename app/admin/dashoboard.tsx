@@ -383,7 +383,7 @@ function KPICard({
   label: string;
   value?: string | number;
   sub: string;
-  icon: (props: any) => JSX.Element;
+  icon: React.ComponentType<React.SVGProps<SVGSVGElement>>;
   tint: string;
 }) {
   return (

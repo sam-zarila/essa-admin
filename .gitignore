@@ -13,7 +13,10 @@
 # testing
 /coverage
 
+# Google Cloud service account key
 service-account.json
+
+
 
 
 # next.js
