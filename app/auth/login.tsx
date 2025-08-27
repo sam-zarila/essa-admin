@@ -7,27 +7,32 @@ import { auth } from "../lib/firebase";
 
 export default function LoginPage() {
   const router = useRouter();
-  const [email, setEmail] = useState("");
-  const [password, setPassword] = useState("");
-  const [showPw, setShowPw] = useState(false);
-  const [loading, setLoading] = useState(false);
+  const [email, setEmail] = useState<string>("");
+  const [password, setPassword] = useState<string>("");
+  const [showPw, setShowPw] = useState<boolean>(false);
+  const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
 
-  const handleSubmit = async (e: React.FormEvent) => {
+  const handleSubmit: React.FormEventHandler<HTMLFormElement> = async (e) => {
     e.preventDefault();
     setError(null);
     setLoading(true);
     try {
       const cred = await signInWithEmailAndPassword(auth, email.trim(), password);
       const token = await getIdTokenResult(cred.user, true);
-      const claims = token.claims as any;
-      const allowed = claims?.admin === true || claims?.officer === true; // RBAC gate
+
+      // Safely inspect custom claims without `any`
+      const claims = token.claims as Record<string, unknown>;
+      const isAdmin = typeof claims["admin"] === "boolean" && (claims["admin"] as boolean);
+      const isOfficer = typeof claims["officer"] === "boolean" && (claims["officer"] as boolean);
+      const allowed = isAdmin || isOfficer;
+
       if (!allowed) {
         await signOut(auth);
         throw new Error("Your account doesn't have admin access. Contact a system admin.");
       }
       router.push("/admin");
-    } catch (err: any) {
+    } catch (err: unknown) {
       const msg = mapFirebaseError(err);
       setError(msg);
     } finally {
@@ -149,8 +154,12 @@ function Spinner() {
   );
 }
 
-function mapFirebaseError(err: any): string {
-  const code = err?.code || err?.message || "unknown";
+type FirebaseLikeError = { code?: unknown; message?: unknown };
+
+function mapFirebaseError(err: unknown): string {
+  const e = err as FirebaseLikeError;
+  const code = typeof e.code === "string" ? e.code : typeof e.message === "string" ? e.message : "unknown";
+
   if (typeof code === "string") {
     if (code.includes("auth/invalid-credential")) return "Invalid email or password.";
     if (code.includes("auth/user-not-found")) return "No user found with that email.";
@@ -158,5 +167,5 @@ function mapFirebaseError(err: any): string {
     if (code.includes("auth/too-many-requests")) return "Too many attempts. Try again later.";
     if (code.includes("auth/network-request-failed")) return "Network error. Check your connection.";
   }
-  return typeof err?.message === "string" ? err.message : "Sign-in failed.";
+  return typeof e.message === "string" ? e.message : "Sign-in failed.";
 }

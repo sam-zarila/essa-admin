@@ -7,6 +7,9 @@ import { adminAuth, adminDb } from "@/app/lib/firebase-admin";
 
 export const runtime = "nodejs";
 
+/* =========================
+   Types
+   ========================= */
 type Loan = {
   id: string;
   firstName?: string;
@@ -23,10 +26,54 @@ type Loan = {
   collateralItems?: Array<{ description?: string }>;
 };
 
+type LoanDoc = {
+  firstName?: string;
+  applicantFirstName?: string;
+  surname?: string;
+  applicantLastName?: string;
+  title?: string;
+  mobileTel?: string;
+  mobile?: string;
+  mobileTel1?: string;
+  loanAmount?: number | string;
+  currentBalance?: number | string;
+  loanPeriod?: number | string;
+  paymentFrequency?: "weekly" | "monthly";
+  status?: string;
+  timestamp?: admin.firestore.Timestamp | null;
+  areaName?: string;
+  collateralItems?: unknown;
+};
+
+type KycDoc = {
+  firstName?: string;
+  lastName?: string;
+  mobileTel1?: string;
+  mobile?: string;
+  timestamp?: admin.firestore.Timestamp | null;
+  createdAt?: admin.firestore.Timestamp | null;
+};
+
+type DecodedClaims = admin.auth.DecodedIdToken & {
+  admin?: boolean;
+  officer?: boolean;
+};
+
+function hasToMillis(
+  x: unknown
+): x is { toMillis: () => number } {
+  return (
+    typeof x === "object" &&
+    x !== null &&
+    "toMillis" in x &&
+    typeof (x as { toMillis: unknown }).toMillis === "function"
+  );
+}
+
 function computeEndDate(
   ts: admin.firestore.Timestamp | null | undefined,
   period: number | undefined,
-  freq: string | undefined
+  freq: Loan["paymentFrequency"] | undefined
 ): Date | null {
   if (!ts || !period || period <= 0) return null;
   const start = ts.toDate();
@@ -39,10 +86,13 @@ function computeEndDate(
   return end;
 }
 
+/* =========================
+   Handler
+   ========================= */
 export async function GET() {
-  // ✅ FIX: await cookies() inside a Route Handler
-  const cookieStore = await cookies();
-  const session = cookieStore.get("__session")?.value;
+  // Read session cookie
+  const cookieStore = cookies();
+  const session = (await cookieStore).get("__session")?.value;
 
   if (!session) {
     return NextResponse.json({ error: "unauthenticated" }, { status: 401 });
@@ -50,14 +100,14 @@ export async function GET() {
 
   try {
     const decoded = await adminAuth().verifySessionCookie(session, true);
-    const claims = decoded as any;
+    const claims: DecodedClaims = decoded;
     if (!claims.admin && !claims.officer) {
       return NextResponse.json({ error: "forbidden" }, { status: 403 });
     }
 
     const db = adminDb();
 
-    // Pull a reasonable window of data for the landing page (latest 200 loans).
+    // Latest 200 loans
     const loansSnap = await db
       .collection("loan_applications")
       .orderBy("timestamp", "desc")
@@ -65,7 +115,12 @@ export async function GET() {
       .get();
 
     const loans: Loan[] = loansSnap.docs.map((d) => {
-      const v = d.data() as any;
+      const v = d.data() as LoanDoc;
+      const collateral =
+        Array.isArray(v.collateralItems)
+          ? (v.collateralItems as Array<{ description?: string }>)
+          : [];
+
       return {
         id: d.id,
         firstName: v.firstName ?? v.applicantFirstName ?? "",
@@ -79,12 +134,12 @@ export async function GET() {
         status: v.status ?? "pending",
         timestamp: v.timestamp ?? null,
         areaName: v.areaName ?? "",
-        collateralItems: Array.isArray(v.collateralItems) ? v.collateralItems : [],
+        collateralItems: collateral,
       };
     });
 
     const now = new Date();
-    const soon = new Date(Date.now() + 1000 * 60 * 60 * 24 * 14); // 14 days
+    const soon = new Date(Date.now() + 14 * 24 * 60 * 60 * 1000); // 14 days
 
     const withDerived = loans.map((r) => {
       const endDate = computeEndDate(r.timestamp ?? null, r.loanPeriod, r.paymentFrequency);
@@ -139,16 +194,27 @@ export async function GET() {
       mobile?: string;
       createdAt?: number | null;
     }> = [];
+
     try {
-      const kycSnap = await db.collection("kyc_data").where("kycCompleted", "==", false).limit(10).get();
+      const kycSnap = await db
+        .collection("kyc_data")
+        .where("kycCompleted", "==", false)
+        .limit(10)
+        .get();
+
       kycPending = kycSnap.docs.map((d) => {
-        const v = d.data() as any;
+        const v = d.data() as KycDoc;
+        const created =
+          (v.timestamp && hasToMillis(v.timestamp) && v.timestamp.toMillis()) ||
+          (v.createdAt && hasToMillis(v.createdAt) && v.createdAt.toMillis()) ||
+          null;
+
         return {
           id: d.id,
           firstName: v.firstName ?? "",
           lastName: v.lastName ?? "",
           mobile: v.mobileTel1 ?? v.mobile ?? "",
-          createdAt: v.timestamp?.toMillis?.() ?? v.createdAt?.toMillis?.() ?? null,
+          createdAt: created,
         };
       });
     } catch {
@@ -171,7 +237,8 @@ export async function GET() {
       kycPending,
       totals,
     });
-  } catch (e) {
-    return NextResponse.json({ error: "server-error" }, { status: 500 });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : "server-error";
+    return NextResponse.json({ error: message }, { status: 500 });
   }
 }

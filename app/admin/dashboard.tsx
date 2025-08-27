@@ -2,12 +2,12 @@
 
 import useSWR, { mutate as globalMutate } from "swr";
 import { useMemo } from "react";
+import type React from "react";
 
-const fetcher = async (u: string) => {
-  const r = await fetch(u);
-  if (!r.ok) throw new Error(`Failed ${r.status}`);
-  return r.json();
-};
+/* =========================
+   Shared types
+   ========================= */
+type FireTimestamp = { seconds: number; nanoseconds?: number };
 
 type Loan = {
   id: string;
@@ -17,14 +17,14 @@ type Loan = {
   mobile?: string;
   areaName?: string;
   loanAmount?: number;
-  loanPeriod?: number; // number of months / weeks
+  loanPeriod?: number; // months or weeks
   paymentFrequency?: "weekly" | "monthly";
   currentBalance?: number;
   endDate?: string | number | Date;
   status?: "pending" | "approved" | "active" | "overdue" | "closed" | string;
-  collateralItems?: Array<any>;
+  collateralItems?: unknown[];
   loanType?: string; // "business" | "payroll" | etc.
-  timestamp?: any;
+  timestamp?: string | number | Date | FireTimestamp;
 };
 
 type Totals = {
@@ -35,6 +35,20 @@ type Totals = {
   overdueCount?: number;
 };
 
+type Breakdown = {
+  status?: Record<string, number>;
+  type?: Record<string, number>;
+  frequency?: Record<string, number>;
+};
+
+type KycApplicant = {
+  id: string;
+  firstName?: string;
+  lastName?: string;
+  mobile?: string;
+  createdAt?: string | number | Date | FireTimestamp;
+};
+
 type OverviewResponse = {
   totals?: Totals;
   outstandingTop?: Loan[];
@@ -42,24 +56,51 @@ type OverviewResponse = {
   overdueWithCollateral?: Loan[];
   finished?: Loan[];
   recentApplicants?: Loan[];
-  kycPending?: any[];
-  // optional richer breakdowns if your API provides them:
-  breakdown?: {
-    status?: Record<string, number>;
-    type?: Record<string, number>;
-    frequency?: Record<string, number>;
-  };
+  kycPending?: KycApplicant[];
+  breakdown?: Breakdown;
   updatedAt?: number; // ms timestamp
 };
 
+/* =========================
+   Fetcher (typed)
+   ========================= */
+const fetcher = async <T,>(u: string): Promise<T> => {
+  const r = await fetch(u);
+  if (!r.ok) throw new Error(`Failed ${r.status}`);
+  return (await r.json()) as T;
+};
+
+const defaultTotals: Totals = {
+  outstandingCount: 0,
+  outstandingBalanceSum: 0,
+  collateralCount: 0,
+  finishedCount: 0,
+  overdueCount: 0,
+};
+
+/* =========================
+   Component
+   ========================= */
 export default function AdminOverview() {
   const { data, isLoading, mutate } = useSWR<OverviewResponse>(
     "/api/admin/overview-data",
-    fetcher,
+    fetcher<OverviewResponse>,
     { refreshInterval: 15000, revalidateOnFocus: true }
   );
 
-  const t = data?.totals ?? {};
+  // ✅ stabilize top-level slices to avoid deps warnings
+  const t = useMemo(() => data?.totals ?? defaultTotals, [data?.totals]);
+  const outstandingTop = useMemo(() => data?.outstandingTop ?? [], [data?.outstandingTop]);
+  const deadlinesUpcoming = useMemo(() => data?.deadlinesUpcoming ?? [], [data?.deadlinesUpcoming]);
+  const overdueWithCollateral = useMemo(
+    () => data?.overdueWithCollateral ?? [],
+    [data?.overdueWithCollateral]
+  );
+  const finished = useMemo(() => data?.finished ?? [], [data?.finished]);
+  const recentApplicants = useMemo(() => data?.recentApplicants ?? [], [data?.recentApplicants]);
+  const kycPending = useMemo(() => data?.kycPending ?? [], [data?.kycPending]);
+  const breakdown = useMemo(() => data?.breakdown, [data?.breakdown]);
+
   const cards = [
     {
       label: "Outstanding Loans",
@@ -91,35 +132,28 @@ export default function AdminOverview() {
     },
   ];
 
-  const outstandingTop = data?.outstandingTop ?? [];
-  const deadlinesUpcoming = data?.deadlinesUpcoming ?? [];
-  const overdueWithCollateral = data?.overdueWithCollateral ?? [];
-  const finished = data?.finished ?? [];
-  const recentApplicants = data?.recentApplicants ?? [];
-  const kycPending = data?.kycPending ?? [];
-
   // ---------- Derived “Detailed Overview” ----------
   const derived = useMemo(() => {
     // status distribution
-    const statusCounts: Record<string, number> = { ...(data?.breakdown?.status || {}) };
+    const statusCounts: Record<string, number> = { ...(breakdown?.status || {}) };
 
-    if (!data?.breakdown?.status) {
+    if (!breakdown?.status) {
       add(statusCounts, "active", t.outstandingCount || 0);
       add(statusCounts, "overdue", t.overdueCount || overdueWithCollateral.length || 0);
       add(statusCounts, "closed", t.finishedCount || finished.length || 0);
     }
 
     // loan type distribution
-    const typeCounts: Record<string, number> = { ...(data?.breakdown?.type || {}) };
-    if (!data?.breakdown?.type) {
+    const typeCounts: Record<string, number> = { ...(breakdown?.type || {}) };
+    if (!breakdown?.type) {
       [...outstandingTop, ...finished, ...deadlinesUpcoming].forEach((r) =>
         add(typeCounts, (r.loanType || "unknown").toLowerCase())
       );
     }
 
     // payment frequency distribution
-    const freqCounts: Record<string, number> = { ...(data?.breakdown?.frequency || {}) };
-    if (!data?.breakdown?.frequency) {
+    const freqCounts: Record<string, number> = { ...(breakdown?.frequency || {}) };
+    if (!breakdown?.frequency) {
       [...outstandingTop, ...finished, ...deadlinesUpcoming].forEach((r) =>
         add(freqCounts, r.paymentFrequency || "monthly")
       );
@@ -133,7 +167,7 @@ export default function AdminOverview() {
       .slice(0, 6);
 
     return { statusCounts, typeCounts, freqCounts, topAreas };
-  }, [data, t, outstandingTop, finished, deadlinesUpcoming, overdueWithCollateral]);
+  }, [breakdown, t, outstandingTop, finished, deadlinesUpcoming, overdueWithCollateral]);
 
   const lastUpdated =
     data?.updatedAt ? timeAgo(new Date(data.updatedAt)) : isLoading ? "—" : "a moment ago";
@@ -333,10 +367,10 @@ export default function AdminOverview() {
             <ListCards
               isLoading={isLoading}
               emptyText="Nothing pending."
-              items={kycPending.map((k: any) => ({
-                title: [k.firstName, k.lastName].filter(Boolean).join(" ") || "—",
+              items={kycPending.map((k) => ({
+                title: fullName({ firstName: k.firstName, lastName: k.lastName }),
                 chips: [k.mobile || "—"],
-                meta: k.createdAt ? new Date(k.createdAt).toLocaleString() : "",
+                meta: k.createdAt ? new Date(normalizeDate(k.createdAt)).toLocaleString() : "",
                 href: `/admin/kyc/${k.id}`,
               }))}
             />
@@ -348,10 +382,10 @@ export default function AdminOverview() {
               emptyText="No recent applications."
               items={recentApplicants.map((r) => ({
                 title: fullName(r),
-                chips: [`MWK ${money(r.loanAmount || 0)}`, (r as any).status || "—"],
+                chips: [`MWK ${money(r.loanAmount || 0)}`, r.status ?? "—"],
                 meta:
-                  r.timestamp?.seconds
-                    ? new Date(r.timestamp.seconds * 1000).toLocaleString()
+                  r.timestamp
+                    ? new Date(normalizeDate(r.timestamp)).toLocaleString()
                     : "",
                 href: `/admin/loans/${r.id}`,
               }))}
@@ -391,7 +425,7 @@ function KPICard({
       <div className="flex items-start justify-between">
         <div className="text-sm text-slate-600">{label}</div>
         <div className={`h-9 w-9 shrink-0 rounded-lg bg-gradient-to-br ${tint} text-white grid place-items-center`}>
-          <Icon className="h-4.5 w-4.5" />
+          <Icon className="h-4 w-4" />
         </div>
       </div>
       <div className="mt-1">
@@ -570,9 +604,7 @@ function MiniDonut({
           )}
         </div>
       </div>
-      <div className="flex-1">
-        {isLoading ? <SkeletonLine count={4} /> : null}
-      </div>
+      <div className="flex-1">{isLoading ? <SkeletonLine count={4} /> : null}</div>
     </div>
   );
 }
@@ -673,9 +705,22 @@ function IconArrowRight(props: React.SVGProps<SVGSVGElement>) {
 /* =========================================================
    utils
    ========================================================= */
-function fullName(r: any) {
-  return [r?.title, r?.firstName, r?.surname].filter(Boolean).join(" ") || "—";
+type Nameable = { title?: string; firstName?: string; surname?: string; lastName?: string };
+
+function fullName(r: Nameable) {
+  const last = r.surname ?? r.lastName;
+  return [r.title, r.firstName, last].filter(Boolean).join(" ") || "—";
 }
+
+function normalizeDate(d: string | number | Date | FireTimestamp): number {
+  if (typeof d === "number") return d;
+  if (typeof d === "string") return Date.parse(d);
+  if (d instanceof Date) return d.getTime();
+  // FireTimestamp
+  if (typeof d === "object" && d && "seconds" in d) return d.seconds * 1000;
+  return NaN;
+}
+
 function fmtDate(d?: string | number | Date | null) {
   if (!d) return "—";
   const date = typeof d === "string" || typeof d === "number" ? new Date(d) : d;
