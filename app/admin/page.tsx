@@ -1,9 +1,10 @@
 import React from "react";
-import AdminOverview from "./dashboard";
+import AdminDashboardPage from "./dashboard";
+
 
 
 export default function Page(){
     return(
-      <AdminOverview/>
+     <AdminDashboardPage/>
     )
 }

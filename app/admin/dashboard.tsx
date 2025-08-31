@@ -1,12 +1,12 @@
 "use client";
 
+import { useEffect, useMemo, useState } from "react";
 import useSWR, { mutate as globalMutate } from "swr";
-import { useMemo } from "react";
 import type React from "react";
 
-/* =========================
-   Shared types
-   ========================= */
+/* =========================================================
+   Types
+   ========================================================= */
 type FireTimestamp = { seconds: number; nanoseconds?: number };
 
 type Loan = {
@@ -17,13 +17,13 @@ type Loan = {
   mobile?: string;
   areaName?: string;
   loanAmount?: number;
-  loanPeriod?: number; // months or weeks
+  loanPeriod?: number;
   paymentFrequency?: "weekly" | "monthly";
   currentBalance?: number;
   endDate?: string | number | Date;
   status?: "pending" | "approved" | "active" | "overdue" | "closed" | string;
   collateralItems?: unknown[];
-  loanType?: string; // "business" | "payroll" | etc.
+  loanType?: string;
   timestamp?: string | number | Date | FireTimestamp;
 };
 
@@ -41,12 +41,15 @@ type Breakdown = {
   frequency?: Record<string, number>;
 };
 
-type KycApplicant = {
+type KycRow = {
   id: string;
   firstName?: string;
   lastName?: string;
   mobile?: string;
-  createdAt?: string | number | Date | FireTimestamp;
+  createdAt?: number | null;
+  email?: string;
+  gender?: string;
+  physicalCity?: string;
 };
 
 type OverviewResponse = {
@@ -56,17 +59,23 @@ type OverviewResponse = {
   overdueWithCollateral?: Loan[];
   finished?: Loan[];
   recentApplicants?: Loan[];
-  kycPending?: KycApplicant[];
+  kycPending?: Array<{
+    id: string;
+    firstName?: string;
+    lastName?: string;
+    mobile?: string;
+    createdAt?: number | string | Date | FireTimestamp;
+  }>;
   breakdown?: Breakdown;
-  updatedAt?: number; // ms timestamp
+  updatedAt?: number;
 };
 
-/* =========================
-   Fetcher (typed)
-   ========================= */
-const fetcher = async <T,>(u: string): Promise<T> => {
+/* =========================================================
+   Fetcher
+   ========================================================= */
+const jsonFetcher = async <T,>(u: string): Promise<T> => {
   const r = await fetch(u);
-  if (!r.ok) throw new Error(`Failed ${r.status}`);
+  if (!r.ok) throw new Error(await r.text());
   return (await r.json()) as T;
 };
 
@@ -78,17 +87,30 @@ const defaultTotals: Totals = {
   overdueCount: 0,
 };
 
-/* =========================
-   Component
-   ========================= */
-export default function AdminOverview() {
+/* =========================================================
+   Page
+   ========================================================= */
+export default function AdminDashboardPage() {
+  // Overview data (public server endpoint)
   const { data, isLoading, mutate } = useSWR<OverviewResponse>(
     "/api/admin/overview-data",
-    fetcher<OverviewResponse>,
+    jsonFetcher,
     { refreshInterval: 15000, revalidateOnFocus: true }
   );
 
-  // ✅ stabilize top-level slices to avoid deps warnings
+  // KYC list (public server endpoint)
+  const {
+    data: kycList,
+    isLoading: kycLoading,
+    error: kycError,
+    mutate: mutateKyc,
+  } = useSWR<{ items: any[]; updatedAt: number }>(
+    "/api/admin/kyc?limit=100",
+    jsonFetcher,
+    { refreshInterval: 15000, revalidateOnFocus: true }
+  );
+
+  // ---------- derived slices ----------
   const t = useMemo(() => data?.totals ?? defaultTotals, [data?.totals]);
   const outstandingTop = useMemo(() => data?.outstandingTop ?? [], [data?.outstandingTop]);
   const deadlinesUpcoming = useMemo(() => data?.deadlinesUpcoming ?? [], [data?.deadlinesUpcoming]);
@@ -98,8 +120,31 @@ export default function AdminOverview() {
   );
   const finished = useMemo(() => data?.finished ?? [], [data?.finished]);
   const recentApplicants = useMemo(() => data?.recentApplicants ?? [], [data?.recentApplicants]);
-  const kycPending = useMemo(() => data?.kycPending ?? [], [data?.kycPending]);
   const breakdown = useMemo(() => data?.breakdown, [data?.breakdown]);
+
+  // KYC rows
+  const kycPending: KycRow[] = useMemo(() => kycList?.items ?? [], [kycList?.items]);
+
+  // ---------- “new KYC” badge counter ----------
+  const [kycNewCount, setKycNewCount] = useState(0);
+  useEffect(() => {
+    const LAST_KEY = "kyc_seen_at";
+    const lastSeen = Number(localStorage.getItem(LAST_KEY) || "0");
+    if (!kycPending.length) {
+      setKycNewCount(0);
+      return;
+    }
+    const count = kycPending.reduce((acc, r) => {
+      const ts = typeof r.createdAt === "number" ? r.createdAt : 0;
+      return acc + (ts > lastSeen ? 1 : 0);
+    }, 0);
+    setKycNewCount(count);
+  }, [kycPending]);
+
+  function markKycSeen() {
+    localStorage.setItem("kyc_seen_at", String(Date.now()));
+    setKycNewCount(0);
+  }
 
   const cards = [
     {
@@ -112,16 +157,16 @@ export default function AdminOverview() {
     {
       label: "Outstanding Balance",
       value: "MWK " + money(t.outstandingBalanceSum || 0),
-      sub: "Sum of current balances",
+      sub: "Sum of balances",
       icon: IconCash,
       tint: "from-rose-500 to-rose-600",
     },
     {
       label: "Collateral Items",
       value: num(t.collateralCount),
-      sub: "Across active loans",
+      sub: "Across loans",
       icon: IconShield,
-      tint: "from-indigo-500 to-indigo-600",
+      tint: "from-indigo-500 to-indo-600",
     },
     {
       label: "Finished Repayments",
@@ -134,16 +179,13 @@ export default function AdminOverview() {
 
   // ---------- Derived “Detailed Overview” ----------
   const derived = useMemo(() => {
-    // status distribution
     const statusCounts: Record<string, number> = { ...(breakdown?.status || {}) };
-
     if (!breakdown?.status) {
       add(statusCounts, "active", t.outstandingCount || 0);
       add(statusCounts, "overdue", t.overdueCount || overdueWithCollateral.length || 0);
       add(statusCounts, "closed", t.finishedCount || finished.length || 0);
     }
 
-    // loan type distribution
     const typeCounts: Record<string, number> = { ...(breakdown?.type || {}) };
     if (!breakdown?.type) {
       [...outstandingTop, ...finished, ...deadlinesUpcoming].forEach((r) =>
@@ -151,7 +193,6 @@ export default function AdminOverview() {
       );
     }
 
-    // payment frequency distribution
     const freqCounts: Record<string, number> = { ...(breakdown?.frequency || {}) };
     if (!breakdown?.frequency) {
       [...outstandingTop, ...finished, ...deadlinesUpcoming].forEach((r) =>
@@ -159,18 +200,18 @@ export default function AdminOverview() {
       );
     }
 
-    // top areas
     const areas: Record<string, number> = {};
     [...outstandingTop, ...deadlinesUpcoming].forEach((r) => add(areas, r.areaName || "—"));
-    const topAreas = Object.entries(areas)
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 6);
+    const topAreas = Object.entries(areas).sort((a, b) => b[1] - a[1]).slice(0, 6);
 
     return { statusCounts, typeCounts, freqCounts, topAreas };
   }, [breakdown, t, outstandingTop, finished, deadlinesUpcoming, overdueWithCollateral]);
 
   const lastUpdated =
     data?.updatedAt ? timeAgo(new Date(data.updatedAt)) : isLoading ? "—" : "a moment ago";
+
+  // ---------- KYC quick-view modal ----------
+  const [viewKycId, setViewKycId] = useState<string | null>(null);
 
   return (
     <div className="min-h-screen w-full bg-slate-50">
@@ -190,7 +231,10 @@ export default function AdminOverview() {
           </div>
           <div className="flex items-center gap-2">
             <button
-              onClick={() => mutate()}
+              onClick={() => {
+                mutate();
+                mutateKyc();
+              }}
               className="inline-flex items-center gap-2 rounded-lg border px-3 py-1.5 text-sm hover:bg-slate-50"
               title="Refresh"
             >
@@ -227,7 +271,6 @@ export default function AdminOverview() {
           </div>
 
           <div className="mt-4 grid gap-4 lg:grid-cols-3">
-            {/* Status Donut */}
             <div className="rounded-xl border p-4">
               <h3 className="font-medium text-slate-800">By Status</h3>
               <MiniDonut
@@ -242,7 +285,6 @@ export default function AdminOverview() {
               <Legend items={Object.entries(derived.statusCounts)} />
             </div>
 
-            {/* Type Donut */}
             <div className="rounded-xl border p-4">
               <h3 className="font-medium text-slate-800">By Type</h3>
               <MiniDonut
@@ -257,12 +299,19 @@ export default function AdminOverview() {
               <Legend items={Object.entries(derived.typeCounts)} />
             </div>
 
-            {/* Frequency & Areas */}
             <div className="grid gap-4">
               <div className="rounded-xl border p-4">
                 <h3 className="font-medium text-slate-800">By Payment Frequency</h3>
-                <BarRow label="Monthly" value={derived.freqCounts["monthly"] || 0} total={sumVals(derived.freqCounts)} />
-                <BarRow label="Weekly" value={derived.freqCounts["weekly"] || 0} total={sumVals(derived.freqCounts)} />
+                <BarRow
+                  label="Monthly"
+                  value={derived.freqCounts["monthly"] || 0}
+                  total={sumVals(derived.freqCounts)}
+                />
+                <BarRow
+                  label="Weekly"
+                  value={derived.freqCounts["weekly"] || 0}
+                  total={sumVals(derived.freqCounts)}
+                />
               </div>
               <div className="rounded-xl border p-4">
                 <h3 className="font-medium text-slate-800">Top Areas</h3>
@@ -286,7 +335,7 @@ export default function AdminOverview() {
           </div>
         </section>
 
-        {/* Main content sections */}
+        {/* Main content */}
         <div className="grid gap-4 xl:grid-cols-2">
           <Section title="Outstanding loans (top 6)">
             <ResponsiveTable
@@ -363,17 +412,73 @@ export default function AdminOverview() {
             />
           </Section>
 
-          <Section title="KYC to review">
-            <ListCards
-              isLoading={isLoading}
-              emptyText="Nothing pending."
-              items={kycPending.map((k) => ({
-                title: fullName({ firstName: k.firstName, lastName: k.lastName }),
-                chips: [k.mobile || "—"],
-                meta: k.createdAt ? new Date(normalizeDate(k.createdAt)).toLocaleString() : "",
-                href: `/admin/kyc/${k.id}`,
-              }))}
-            />
+          {/* KYC Section with badge + actions + modal */}
+          <Section
+            title={
+              <div className="flex items-center gap-2">
+                <span>KYC to review</span>
+                {kycNewCount > 0 && (
+                  <span className="inline-flex items-center justify-center h-5 min-w-[20px] rounded-full bg-rose-600 text-white text-xs px-1">
+                    {kycNewCount}
+                  </span>
+                )}
+              </div>
+            }
+            extra={
+              <button
+                onClick={markKycSeen}
+                className="rounded-lg bg-blue-600 text-white px-2.5 py-1 text-xs hover:bg-blue-700"
+                title="Reset new counter"
+              >
+                Mark seen
+              </button>
+            }
+          >
+            <div className="grid gap-2">
+              {kycLoading && <SkeletonLine count={3} />}
+              {kycError && (
+                <div className="text-sm text-rose-600">Failed to load KYC.</div>
+              )}
+              {!kycLoading && !kycError && kycPending.length === 0 && (
+                <div className="text-center text-slate-500">Nothing pending.</div>
+              )}
+              {!kycLoading &&
+                !kycError &&
+                kycPending.map((k) => (
+                  <div
+                    key={k.id}
+                    className="rounded-xl border bg-white p-3 flex items-start justify-between gap-2"
+                  >
+                    <div>
+                      <div className="font-medium text-slate-900">
+                        {fullName({ firstName: k.firstName, lastName: k.lastName })}
+                      </div>
+                      <div className="text-xs text-slate-500 mt-0.5">
+                        {k.createdAt ? new Date(k.createdAt).toLocaleString() : "—"}
+                      </div>
+                      <div className="text-xs text-slate-600 mt-1">
+                        {(k.mobile || "—")}{k.email ? ` · ${k.email}` : ""}
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <a
+                        href={`/admin/kyc/${k.id}`}
+                        className="rounded-lg border px-2.5 py-1.5 text-xs hover:bg-slate-50"
+                      >
+                        Open page
+                      </a>
+                      <button
+                        onClick={() => setViewKycId(k.id)}
+                        className="rounded-lg bg-blue-600 text-white px-2.5 py-1.5 text-xs hover:bg-blue-700"
+                      >
+                        View KYC
+                      </button>
+                    </div>
+                  </div>
+                ))}
+            </div>
+
+            <KycPreviewModal kycId={viewKycId} onClose={() => setViewKycId(null)} />
           </Section>
 
           <Section title="Recent applicants">
@@ -383,10 +488,7 @@ export default function AdminOverview() {
               items={recentApplicants.map((r) => ({
                 title: fullName(r),
                 chips: [`MWK ${money(r.loanAmount || 0)}`, r.status ?? "—"],
-                meta:
-                  r.timestamp
-                    ? new Date(normalizeDate(r.timestamp)).toLocaleString()
-                    : "",
+                meta: r.timestamp ? new Date(normalizeDate(r.timestamp)).toLocaleString() : "",
                 href: `/admin/loans/${r.id}`,
               }))}
             />
@@ -395,11 +497,105 @@ export default function AdminOverview() {
 
         <div className="pt-2 pb-8 text-center text-xs text-slate-500">
           Dashboard auto-refreshes every 15s ·{" "}
-          <button className="underline" onClick={() => globalMutate("/api/admin/overview-data")}>
+          <button
+            className="underline"
+            onClick={() => {
+              globalMutate("/api/admin/overview-data");
+              mutateKyc();
+            }}
+          >
             force refresh
           </button>
         </div>
       </main>
+    </div>
+  );
+}
+
+/* =========================================================
+   KYC Preview Modal (fetches /api/admin/kyc?id=...)
+   ========================================================= */
+function KycPreviewModal({
+  kycId,
+  onClose,
+}: {
+  kycId: string | null;
+  onClose: () => void;
+}) {
+  const { data, isLoading, error } = useSWR<any>(
+    kycId ? `/api/admin/kyc?id=${encodeURIComponent(kycId)}` : null,
+    jsonFetcher,
+    { revalidateOnFocus: false }
+  );
+
+  if (!kycId) return null;
+
+  return (
+    <div className="fixed inset-0 z-40">
+      <div className="absolute inset-0 bg-black/40" onClick={onClose} />
+      <div className="absolute inset-x-0 top-10 mx-auto w-[94%] max-w-2xl">
+        <div className="rounded-2xl border bg-white shadow-xl">
+          <div className="flex items-center justify-between p-4 border-b">
+            <h3 className="text-base font-semibold text-slate-900">KYC Preview</h3>
+            <button
+              onClick={onClose}
+              className="rounded-lg border px-2 py-1 text-sm hover:bg-slate-50"
+            >
+              Close
+            </button>
+          </div>
+          <div className="p-4">
+            {isLoading && <SkeletonLine count={6} />}
+            {error && <div className="text-rose-600 text-sm">Failed to load KYC.</div>}
+            {!isLoading && !error && (
+              <div className="grid gap-2 text-sm">
+                <KV
+                  label="Name"
+                  value={
+                    [data?.title, data?.firstName, data?.lastName]
+                      .filter(Boolean)
+                      .join(" ") || "—"
+                  }
+                />
+                <KV label="ID Number" value={data?.idNumber || "—"} />
+                <KV label="Gender" value={data?.gender || "—"} />
+                <KV label="Date of Birth" value={fmtMaybeDate(data?.dateOfBirth)} />
+                <KV label="Email" value={data?.email1 || data?.email || "—"} />
+                <KV label="Mobile" value={data?.mobileTel1 || data?.mobile || "—"} />
+                <KV
+                  label="Address / City"
+                  value={data?.physicalAddress || data?.physicalCity || data?.areaName || "—"}
+                />
+                <KV label="Employer" value={data?.employer || "—"} />
+                <KV label="Dependants" value={String(data?.dependants ?? "—")} />
+                <KV
+                  label="Next of Kin"
+                  value={`${data?.familyName || "—"} (${
+                    data?.familyRelation || "—"
+                  })${data?.familyMobile ? " · " + data?.familyMobile : ""}`}
+                />
+              </div>
+            )}
+          </div>
+          <div className="p-4 border-t text-right">
+            <a
+              href={`/admin/kyc/${kycId}`}
+              className="inline-flex items-center rounded-lg bg-blue-600 text-white px-3 py-1.5 text-sm hover:bg-blue-700"
+            >
+              Open Full KYC
+            </a>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function KV({ label, value }: { label: string; value: React.ReactNode }) {
+  return (
+    <div className="flex items-start gap-3">
+      <div className="w-40 shrink-0 text-slate-500">{label}</div>
+      <div className="text-slate-900">{value}</div>
     </div>
   );
 }
@@ -424,7 +620,9 @@ function KPICard({
     <div className="rounded-2xl border bg-white p-4 shadow-sm">
       <div className="flex items-start justify-between">
         <div className="text-sm text-slate-600">{label}</div>
-        <div className={`h-9 w-9 shrink-0 rounded-lg bg-gradient-to-br ${tint} text-white grid place-items-center`}>
+        <div
+          className={`h-9 w-9 shrink-0 rounded-lg bg-gradient-to-br ${tint} text-white grid place-items-center`}
+        >
           <Icon className="h-4 w-4" />
         </div>
       </div>
@@ -440,11 +638,20 @@ function KPICard({
   );
 }
 
-function Section({ title, children }: { title: string; children: React.ReactNode }) {
+function Section({
+  title,
+  extra,
+  children,
+}: {
+  title: React.ReactNode;
+  extra?: React.ReactNode;
+  children: React.ReactNode;
+}) {
   return (
     <section className="rounded-2xl border bg-white p-4 sm:p-5">
       <div className="flex items-center justify-between">
         <h2 className="text-base font-semibold text-slate-900">{title}</h2>
+        {extra}
       </div>
       <div className="mt-3">{children}</div>
     </section>
@@ -464,7 +671,6 @@ function ResponsiveTable({
 }) {
   return (
     <>
-      {/* desktop */}
       <div className="hidden md:block overflow-auto rounded-xl border">
         <table className="w-full text-sm">
           <thead className="bg-slate-50 text-slate-600 sticky top-0">
@@ -505,10 +711,11 @@ function ResponsiveTable({
         </table>
       </div>
 
-      {/* mobile cards */}
       <div className="md:hidden grid gap-3">
         {isLoading && <div className="text-center text-slate-500">Loading…</div>}
-        {!isLoading && rows.length === 0 && <div className="text-center text-slate-500">{emptyText}</div>}
+        {!isLoading && rows.length === 0 && (
+          <div className="text-center text-slate-500">{emptyText}</div>
+        )}
         {!isLoading &&
           rows.length > 0 &&
           rows.map((r, i) => (
@@ -535,7 +742,9 @@ function ListCards({
   return (
     <div className="grid gap-2">
       {isLoading && <SkeletonLine count={3} />}
-      {!isLoading && items.length === 0 && <div className="text-center text-slate-500">{emptyText}</div>}
+      {!isLoading && items.length === 0 && (
+        <div className="text-center text-slate-500">{emptyText}</div>
+      )}
       {!isLoading &&
         items.map((it, i) => (
           <a
@@ -599,7 +808,9 @@ function MiniDonut({
           ) : (
             <div className="text-center">
               <div className="text-xs text-slate-500">{centerLabel}</div>
-              <div className="text-sm font-semibold text-slate-900 tabular-nums">{num(total)}</div>
+              <div className="text-sm font-semibold text-slate-900 tabular-nums">
+                {num(total)}
+              </div>
             </div>
           )}
         </div>
@@ -660,44 +871,53 @@ function SkeletonLine({ count = 3 }: { count?: number }) {
 function IconRefresh(props: React.SVGProps<SVGSVGElement>) {
   return (
     <svg viewBox="0 0 24 24" fill="none" {...props}>
-      <path d="M4 4v6h6M20 20v-6h-6M20 10a8 8 0 0 0-14.9-3M4 14a8 8 0 0 0 14.9 3" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/>
+      <path
+        d="M4 4v6h6M20 20v-6h-6M20 10a8 8 0 0 0-14.9-3M4 14a8 8 0 0 0 14.9 3"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+      />
     </svg>
   );
 }
 function IconClipboard(props: React.SVGProps<SVGSVGElement>) {
   return (
     <svg viewBox="0 0 24 24" fill="none" {...props}>
-      <rect x="6" y="4" width="12" height="16" rx="2" stroke="currentColor" strokeWidth="2"/>
-      <path d="M9 4h6v2H9z" fill="currentColor"/>
+      <rect x="6" y="4" width="12" height="16" rx="2" stroke="currentColor" strokeWidth="2" />
+      <path d="M9 4h6v2H9z" fill="currentColor" />
     </svg>
   );
 }
 function IconCash(props: React.SVGProps<SVGSVGElement>) {
   return (
     <svg viewBox="0 0 24 24" fill="none" {...props}>
-      <rect x="3" y="6" width="18" height="12" rx="2" stroke="currentColor" strokeWidth="2"/>
-      <circle cx="12" cy="12" r="2.5" stroke="currentColor" strokeWidth="2"/>
+      <rect x="3" y="6" width="18" height="12" rx="2" stroke="currentColor" strokeWidth="2" />
+      <circle cx="12" cy="12" r="2.5" stroke="currentColor" strokeWidth="2" />
     </svg>
   );
 }
 function IconShield(props: React.SVGProps<SVGSVGElement>) {
   return (
     <svg viewBox="0 0 24 24" fill="none" {...props}>
-      <path d="M12 3l7 3v5c0 5-3.5 8-7 10-3.5-2-7-5-7-10V6l7-3z" stroke="currentColor" strokeWidth="2"/>
+      <path
+        d="M12 3l7 3v5c0 5-3.5 8-7 10-3.5-2-7-5-7-10V6l7-3z"
+        stroke="currentColor"
+        strokeWidth="2"
+      />
     </svg>
   );
 }
 function IconCheck(props: React.SVGProps<SVGSVGElement>) {
   return (
     <svg viewBox="0 0 24 24" fill="none" {...props}>
-      <path d="M20 6L9 17l-5-5" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/>
+      <path d="M20 6L9 17l-5-5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
     </svg>
   );
 }
 function IconArrowRight(props: React.SVGProps<SVGSVGElement>) {
   return (
     <svg viewBox="0 0 24 24" fill="none" {...props}>
-      <path d="M5 12h14M13 5l7 7-7 7" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/>
+      <path d="M5 12h14M13 5l7 7-7 7" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
     </svg>
   );
 }
@@ -716,8 +936,7 @@ function normalizeDate(d: string | number | Date | FireTimestamp): number {
   if (typeof d === "number") return d;
   if (typeof d === "string") return Date.parse(d);
   if (d instanceof Date) return d.getTime();
-  // FireTimestamp
-  if (typeof d === "object" && d && "seconds" in d) return d.seconds * 1000;
+  if (typeof d === "object" && d && "seconds" in d) return (d as FireTimestamp).seconds * 1000;
   return NaN;
 }
 
@@ -727,6 +946,19 @@ function fmtDate(d?: string | number | Date | null) {
   if (!(date instanceof Date) || isNaN(date.getTime())) return "—";
   return date.toLocaleDateString();
 }
+
+function fmtMaybeDate(v: any) {
+  if (!v) return "—";
+  try {
+    if (typeof v?.toDate === "function") return v.toDate().toLocaleDateString();
+    if (typeof v?.seconds === "number") return new Date(v.seconds * 1000).toLocaleDateString();
+    const d = new Date(v);
+    return isNaN(d.getTime()) ? "—" : d.toLocaleDateString();
+  } catch {
+    return "—";
+  }
+}
+
 function money(n: number) {
   try {
     return new Intl.NumberFormat().format(Math.round(n));
