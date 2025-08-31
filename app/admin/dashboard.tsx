@@ -1,8 +1,21 @@
+// app/admin/dashboard.tsx
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
-import useSWR, { mutate as globalMutate } from "swr";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type React from "react";
+import {
+  collection,
+  doc as fsDoc,
+  getDoc,
+  limit as fsLimit,
+  onSnapshot,
+  orderBy,
+  query,
+  Timestamp,
+  getDocs,
+} from "firebase/firestore";
+import { db } from "../lib/firebase";
+
 
 /* =========================================================
    Types
@@ -20,11 +33,11 @@ type Loan = {
   loanPeriod?: number;
   paymentFrequency?: "weekly" | "monthly";
   currentBalance?: number;
-  endDate?: string | number | Date;
+  endDate?: string | number | Date | null;
   status?: "pending" | "approved" | "active" | "overdue" | "closed" | string;
   collateralItems?: unknown[];
   loanType?: string;
-  timestamp?: string | number | Date | FireTimestamp;
+  timestamp?: Timestamp | FireTimestamp | number | string | Date | null;
 };
 
 type Totals = {
@@ -52,78 +65,358 @@ type KycRow = {
   physicalCity?: string;
 };
 
-type OverviewResponse = {
-  totals?: Totals;
-  outstandingTop?: Loan[];
-  deadlinesUpcoming?: Loan[];
-  overdueWithCollateral?: Loan[];
-  finished?: Loan[];
-  recentApplicants?: Loan[];
-  kycPending?: Array<{
-    id: string;
-    firstName?: string;
-    lastName?: string;
-    mobile?: string;
-    createdAt?: number | string | Date | FireTimestamp;
-  }>;
-  breakdown?: Breakdown;
-  updatedAt?: number;
-};
-
 /* =========================================================
-   Fetcher
+   Helpers
    ========================================================= */
-const jsonFetcher = async <T,>(u: string): Promise<T> => {
-  const r = await fetch(u);
-  if (!r.ok) throw new Error(await r.text());
-  return (await r.json()) as T;
-};
+function toMillis(v: any): number | null {
+  try {
+    if (!v) return null;
+    if (v instanceof Date) return v.getTime();
+    if (typeof v === "number") return v;
+    if (typeof v === "string") return Date.parse(v);
+    if (typeof v === "object" && "seconds" in v) return v.seconds * 1000;
+    if (typeof v?.toDate === "function") return (v as Timestamp).toDate().getTime();
+  } catch {}
+  return null;
+}
 
-const defaultTotals: Totals = {
-  outstandingCount: 0,
-  outstandingBalanceSum: 0,
-  collateralCount: 0,
-  finishedCount: 0,
-  overdueCount: 0,
-};
+function computeEndDate(
+  ts: any,
+  period?: number,
+  freq?: "weekly" | "monthly"
+): Date | null {
+  const startMs = toMillis(ts);
+  if (!startMs || !period || period <= 0) return null;
+  const start = new Date(startMs);
+  const end = new Date(start);
+  if (freq === "weekly") end.setDate(end.getDate() + period * 7);
+  else end.setMonth(end.getMonth() + period);
+  return end;
+}
+
+function fullName(r: { title?: string; firstName?: string; surname?: string; lastName?: string }) {
+  const last = r.surname ?? r.lastName;
+  return [r.title, r.firstName, last].filter(Boolean).join(" ") || "—";
+}
+function fmtDate(d?: string | number | Date | null) {
+  if (!d) return "—";
+  const date = typeof d === "string" || typeof d === "number" ? new Date(d) : d;
+  if (!(date instanceof Date) || isNaN(date.getTime())) return "—";
+  return date.toLocaleDateString();
+}
+function fmtMaybeDate(v: any) {
+  const ms = toMillis(v);
+  return ms ? new Date(ms).toLocaleDateString() : "—";
+}
+function money(n: number) {
+  try { return new Intl.NumberFormat().format(Math.round(n)); } catch { return String(n); }
+}
+function num(n?: number) {
+  try { return new Intl.NumberFormat().format(n || 0); } catch { return String(n || 0); }
+}
+function timeAgo(d: Date) {
+  const s = Math.floor((Date.now() - d.getTime()) / 1000);
+  if (s < 60) return `${s}s ago`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  const days = Math.floor(h / 24);
+  return `${days}d ago`;
+}
+function add(obj: Record<string, number>, key: string, inc = 1) {
+  obj[key] = (obj[key] || 0) + inc;
+}
+function sumVals(obj: Record<string, number>) {
+  return Object.values(obj).reduce((s, v) => s + v, 0);
+}
+function toSegments(
+  map: Record<string, number>,
+  palette: Record<string, string>
+): Array<{ label: string; value: number; color: string }> {
+  return Object.entries(map).map(([label, value]) => ({
+    label,
+    value,
+    color: palette[label] || pickColor(label),
+  }));
+}
+function pickColor(seed: string) {
+  const colors = ["#0ea5e9", "#6366f1", "#a855f7", "#22c55e", "#f59e0b", "#ef4444", "#14b8a6"];
+  let h = 0;
+  for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) >>> 0;
+  return colors[h % colors.length];
+}
+function conicCSS(data: Array<{ value: number; color: string }>) {
+  const total = Math.max(1, data.reduce((s, d) => s + d.value, 0));
+  let acc = 0;
+  const stops = data.map((d) => {
+    const start = (acc / total) * 360;
+    acc += d.value;
+    const end = (acc / total) * 360;
+    return `${d.color} ${start}deg ${end}deg`;
+  });
+  return `conic-gradient(${stops.join(",")})`;
+}
 
 /* =========================================================
    Page
    ========================================================= */
 export default function AdminDashboardPage() {
-  // Overview data (public server endpoint)
-  const { data, isLoading, mutate } = useSWR<OverviewResponse>(
-    "/api/admin/overview-data",
-    jsonFetcher,
-    { refreshInterval: 15000, revalidateOnFocus: true }
-  );
+  // ---------- Loans (client Firestore, realtime) ----------
+  const [loans, setLoans] = useState<Loan[]>([]);
+  const [loansLoading, setLoansLoading] = useState(true);
+  const [loansError, setLoansError] = useState<string | null>(null);
+  const [updatedAt, setUpdatedAt] = useState<number | null>(null);
 
-  // KYC list (public server endpoint)
-  const {
-    data: kycList,
-    isLoading: kycLoading,
-    error: kycError,
-    mutate: mutateKyc,
-  } = useSWR<{ items: any[]; updatedAt: number }>(
-    "/api/admin/kyc?limit=100",
-    jsonFetcher,
-    { refreshInterval: 15000, revalidateOnFocus: true }
-  );
+  useEffect(() => {
+    setLoansLoading(true);
+    setLoansError(null);
 
-  // ---------- derived slices ----------
-  const t = useMemo(() => data?.totals ?? defaultTotals, [data?.totals]);
-  const outstandingTop = useMemo(() => data?.outstandingTop ?? [], [data?.outstandingTop]);
-  const deadlinesUpcoming = useMemo(() => data?.deadlinesUpcoming ?? [], [data?.deadlinesUpcoming]);
+    const loansRef = collection(db, "loan_applications");
+    const q = query(loansRef, orderBy("timestamp", "desc"), fsLimit(200));
+
+    const unsub = onSnapshot(
+      q,
+      (snap) => {
+        const rows: Loan[] = snap.docs.map((d) => {
+          const v = d.data() as any;
+          const status = String(v.status || "pending").toLowerCase();
+          const paymentFrequency = (v.paymentFrequency ?? "monthly") as "weekly" | "monthly";
+          const loanPeriod = Number(v.loanPeriod ?? 0);
+          const ts = v.timestamp ?? null;
+
+          return {
+            id: d.id,
+            firstName: v.firstName ?? v.applicantFirstName ?? "",
+            surname: v.surname ?? v.applicantLastName ?? "",
+            title: v.title ?? "",
+            mobile: v.mobileTel ?? v.mobile ?? v.mobileTel1 ?? "",
+            loanAmount: Number(v.loanAmount ?? 0),
+            currentBalance: Number(v.currentBalance ?? v.loanAmount ?? 0),
+            loanPeriod,
+            paymentFrequency,
+            status,
+            timestamp: ts,
+            endDate: computeEndDate(ts, loanPeriod, paymentFrequency),
+            areaName: v.areaName ?? "",
+            collateralItems: Array.isArray(v.collateralItems) ? v.collateralItems : [],
+            loanType: String(v.loanType || "unknown").toLowerCase(),
+          };
+        });
+        setLoans(rows);
+        setUpdatedAt(Date.now());
+        setLoansLoading(false);
+      },
+      async (err) => {
+        console.warn("[loans:onSnapshot] falling back to .limit()", err);
+        try {
+          const snap = await getDocs(query(collection(db, "loan_applications"), fsLimit(200)));
+          const rows: Loan[] = snap.docs.map((d) => {
+            const v = d.data() as any;
+            const status = String(v.status || "pending").toLowerCase();
+            const paymentFrequency = (v.paymentFrequency ?? "monthly") as "weekly" | "monthly";
+            const loanPeriod = Number(v.loanPeriod ?? 0);
+            const ts = v.timestamp ?? null;
+            return {
+              id: d.id,
+              firstName: v.firstName ?? v.applicantFirstName ?? "",
+              surname: v.surname ?? v.applicantLastName ?? "",
+              title: v.title ?? "",
+              mobile: v.mobileTel ?? v.mobile ?? v.mobileTel1 ?? "",
+              loanAmount: Number(v.loanAmount ?? 0),
+              currentBalance: Number(v.currentBalance ?? v.loanAmount ?? 0),
+              loanPeriod,
+              paymentFrequency,
+              status,
+              timestamp: ts,
+              endDate: computeEndDate(ts, loanPeriod, paymentFrequency),
+              areaName: v.areaName ?? "",
+              collateralItems: Array.isArray(v.collateralItems) ? v.collateralItems : [],
+              loanType: String(v.loanType || "unknown").toLowerCase(),
+            };
+          });
+          setLoans(rows);
+          setUpdatedAt(Date.now());
+          setLoansLoading(false);
+        } catch (e: any) {
+          setLoansError(e?.message || "Failed to load loans");
+          setLoansLoading(false);
+        }
+      }
+    );
+
+    return () => unsub();
+  }, []);
+
+  // ---------- KYC (client Firestore, realtime) ----------
+  const [kycPending, setKycPending] = useState<KycRow[]>([]);
+  const [kycLoading, setKycLoading] = useState(true);
+  const [kycError, setKycError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setKycLoading(true);
+    setKycError(null);
+
+    const base = collection(db, "kyc_data");
+    const q1 = query(base, orderBy("createdAt", "desc"), fsLimit(100));
+
+    const unsub = onSnapshot(
+      q1,
+      (snap) => {
+        const rows = snap.docs.map((d) => {
+          const v = d.data() as any;
+          return {
+            id: d.id,
+            firstName: v.firstName ?? v.applicantFirstName ?? "",
+            lastName: v.lastName ?? v.applicantLastName ?? "",
+            mobile: v.mobileTel1 ?? v.mobile ?? "",
+            email: v.email1 ?? v.email ?? "",
+            gender: v.gender ?? "",
+            physicalCity: v.physicalCity ?? v.areaName ?? "",
+            createdAt: toMillis(v.createdAt) ?? toMillis(v.timestamp) ?? null,
+          } as KycRow;
+        });
+        setKycPending(rows);
+        setKycLoading(false);
+      },
+      async () => {
+        // fallback: try timestamp
+        try {
+          const q2 = query(base, orderBy("timestamp", "desc"), fsLimit(100));
+          const snap = await getDocs(q2);
+          const rows = snap.docs.map((d) => {
+            const v = d.data() as any;
+            return {
+              id: d.id,
+              firstName: v.firstName ?? v.applicantFirstName ?? "",
+              lastName: v.lastName ?? v.applicantLastName ?? "",
+              mobile: v.mobileTel1 ?? v.mobile ?? "",
+              email: v.email1 ?? v.email ?? "",
+              gender: v.gender ?? "",
+              physicalCity: v.physicalCity ?? v.areaName ?? "",
+              createdAt: toMillis(v.createdAt) ?? toMillis(v.timestamp) ?? null,
+            } as KycRow;
+          });
+          setKycPending(rows);
+          setKycLoading(false);
+        } catch (e) {
+          // ultimate fallback: simple limit
+          try {
+            const snap = await getDocs(query(base, fsLimit(100)));
+            const rows = snap.docs.map((d) => {
+              const v = d.data() as any;
+              return {
+                id: d.id,
+                firstName: v.firstName ?? v.applicantFirstName ?? "",
+                lastName: v.lastName ?? v.applicantLastName ?? "",
+                mobile: v.mobileTel1 ?? v.mobile ?? "",
+                email: v.email1 ?? v.email ?? "",
+                gender: v.gender ?? "",
+                physicalCity: v.physicalCity ?? v.areaName ?? "",
+                createdAt: toMillis(v.createdAt) ?? toMillis(v.timestamp) ?? null,
+              } as KycRow;
+            });
+            setKycPending(rows);
+            setKycLoading(false);
+          } catch (err: any) {
+            setKycError(err?.message || "Failed to load KYC");
+            setKycLoading(false);
+          }
+        }
+      }
+    );
+
+    return () => unsub();
+  }, []);
+
+  // ---------- Derived slices from loans ----------
+  const outstanding = useMemo(
+    () =>
+      loans
+        .filter(
+          (r) =>
+            (r.status === "approved" || r.status === "active") &&
+            (r.currentBalance ?? 0) > 0
+        )
+        .sort((a, b) => (b.currentBalance ?? 0) - (a.currentBalance ?? 0)),
+    [loans]
+  );
+  const outstandingTop = useMemo(() => outstanding.slice(0, 6), [outstanding]);
+  const now = new Date();
+  const soon = new Date(Date.now() + 14 * 24 * 60 * 60 * 1000);
+  const deadlinesUpcoming = useMemo(
+    () =>
+      loans
+        .filter((r) => {
+          const end = r.endDate ? new Date(r.endDate) : null;
+          return (
+            (r.status === "approved" || r.status === "active") &&
+            (r.currentBalance ?? 0) > 0 &&
+            end &&
+            end >= now &&
+            end <= soon
+          );
+        })
+        .sort((a, b) => new Date(a.endDate || 0).getTime() - new Date(b.endDate || 0).getTime())
+        .slice(0, 8),
+    [loans]
+  );
   const overdueWithCollateral = useMemo(
-    () => data?.overdueWithCollateral ?? [],
-    [data?.overdueWithCollateral]
+    () =>
+      loans
+        .filter((r) => {
+          const end = r.endDate ? new Date(r.endDate) : null;
+          return (
+            (r.status === "approved" || r.status === "active") &&
+            (r.currentBalance ?? 0) > 0 &&
+            end &&
+            end < now &&
+            (r.collateralItems?.length ?? 0) > 0
+          );
+        })
+        .sort((a, b) => new Date(a.endDate || 0).getTime() - new Date(b.endDate || 0).getTime())
+        .slice(0, 8),
+    [loans]
   );
-  const finished = useMemo(() => data?.finished ?? [], [data?.finished]);
-  const recentApplicants = useMemo(() => data?.recentApplicants ?? [], [data?.recentApplicants]);
-  const breakdown = useMemo(() => data?.breakdown, [data?.breakdown]);
+  const finished = useMemo(
+    () =>
+      loans
+        .filter(
+          (r) =>
+            (r.currentBalance ?? 0) <= 0 ||
+            r.status === "closed" ||
+            r.status === "finished"
+        )
+        .slice(0, 8),
+    [loans]
+  );
+  const recentApplicants = useMemo(() => loans.slice(0, 8), [loans]);
 
-  // KYC rows
-  const kycPending: KycRow[] = useMemo(() => kycList?.items ?? [], [kycList?.items]);
+  const totals: Totals = useMemo(
+    () => ({
+      outstandingCount: outstanding.length,
+      outstandingBalanceSum: outstanding.reduce((s, r) => s + (r.currentBalance || 0), 0),
+      collateralCount: loans.reduce((s, r) => s + (r.collateralItems?.length ?? 0), 0),
+      finishedCount: finished.length,
+      overdueCount: loans.filter((r) => {
+        const end = r.endDate ? new Date(r.endDate) : null;
+        return end && end < now && (r.currentBalance ?? 0) > 0;
+      }).length,
+    }),
+    [loans, outstanding, finished]
+  );
+
+  const breakdown: Breakdown = useMemo(() => {
+    const status: Record<string, number> = {};
+    const type: Record<string, number> = {};
+    const frequency: Record<string, number> = {};
+    loans.forEach((r) => {
+      add(status, String(r.status || "pending").toLowerCase());
+      add(type, String(r.loanType || "unknown").toLowerCase());
+      add(frequency, String(r.paymentFrequency || "monthly"));
+    });
+    return { status, type, frequency };
+  }, [loans]);
 
   // ---------- “new KYC” badge counter ----------
   const [kycNewCount, setKycNewCount] = useState(0);
@@ -146,72 +439,17 @@ export default function AdminDashboardPage() {
     setKycNewCount(0);
   }
 
-  const cards = [
-    {
-      label: "Outstanding Loans",
-      value: num(t.outstandingCount),
-      sub: "Active with balance",
-      icon: IconClipboard,
-      tint: "from-amber-500 to-amber-600",
-    },
-    {
-      label: "Outstanding Balance",
-      value: "MWK " + money(t.outstandingBalanceSum || 0),
-      sub: "Sum of balances",
-      icon: IconCash,
-      tint: "from-rose-500 to-rose-600",
-    },
-    {
-      label: "Collateral Items",
-      value: num(t.collateralCount),
-      sub: "Across loans",
-      icon: IconShield,
-      tint: "from-indigo-500 to-indo-600",
-    },
-    {
-      label: "Finished Repayments",
-      value: num(t.finishedCount),
-      sub: "Recently closed",
-      icon: IconCheck,
-      tint: "from-emerald-500 to-emerald-600",
-    },
-  ];
-
-  // ---------- Derived “Detailed Overview” ----------
-  const derived = useMemo(() => {
-    const statusCounts: Record<string, number> = { ...(breakdown?.status || {}) };
-    if (!breakdown?.status) {
-      add(statusCounts, "active", t.outstandingCount || 0);
-      add(statusCounts, "overdue", t.overdueCount || overdueWithCollateral.length || 0);
-      add(statusCounts, "closed", t.finishedCount || finished.length || 0);
-    }
-
-    const typeCounts: Record<string, number> = { ...(breakdown?.type || {}) };
-    if (!breakdown?.type) {
-      [...outstandingTop, ...finished, ...deadlinesUpcoming].forEach((r) =>
-        add(typeCounts, (r.loanType || "unknown").toLowerCase())
-      );
-    }
-
-    const freqCounts: Record<string, number> = { ...(breakdown?.frequency || {}) };
-    if (!breakdown?.frequency) {
-      [...outstandingTop, ...finished, ...deadlinesUpcoming].forEach((r) =>
-        add(freqCounts, r.paymentFrequency || "monthly")
-      );
-    }
-
-    const areas: Record<string, number> = {};
-    [...outstandingTop, ...deadlinesUpcoming].forEach((r) => add(areas, r.areaName || "—"));
-    const topAreas = Object.entries(areas).sort((a, b) => b[1] - a[1]).slice(0, 6);
-
-    return { statusCounts, typeCounts, freqCounts, topAreas };
-  }, [breakdown, t, outstandingTop, finished, deadlinesUpcoming, overdueWithCollateral]);
-
-  const lastUpdated =
-    data?.updatedAt ? timeAgo(new Date(data.updatedAt)) : isLoading ? "—" : "a moment ago";
-
-  // ---------- KYC quick-view modal ----------
+  // ---------- Modal state ----------
   const [viewKycId, setViewKycId] = useState<string | null>(null);
+
+  // ---------- Header & KPIs ----------
+  const lastUpdated = updatedAt ? timeAgo(new Date(updatedAt)) : loansLoading ? "—" : "a moment ago";
+  const cards = [
+    { label: "Outstanding Loans", value: num(totals.outstandingCount), sub: "Active with balance", icon: IconClipboard, tint: "from-amber-500 to-amber-600" },
+    { label: "Outstanding Balance", value: "MWK " + money(totals.outstandingBalanceSum || 0), sub: "Sum of balances", icon: IconCash, tint: "from-rose-500 to-rose-600" },
+    { label: "Collateral Items", value: num(totals.collateralCount), sub: "Across loans", icon: IconShield, tint: "from-indigo-500 to-indigo-600" }, // fixed typo
+    { label: "Finished Repayments", value: num(totals.finishedCount), sub: "Recently closed", icon: IconCheck, tint: "from-emerald-500 to-emerald-600" },
+  ];
 
   return (
     <div className="min-h-screen w-full bg-slate-50">
@@ -219,22 +457,15 @@ export default function AdminDashboardPage() {
       <header className="sticky top-0 z-20 border-b bg-white/90 backdrop-blur supports-[backdrop-filter]:bg-white/60">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 h-16 flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <div className="h-9 w-9 rounded-lg bg-gradient-to-br from-blue-600 to-indigo-600 text-white grid place-items-center font-semibold">
-              EL
-            </div>
+            <div className="h-9 w-9 rounded-lg bg-gradient-to-br from-blue-600 to-indigo-600 text-white grid place-items-center font-semibold">EL</div>
             <div>
-              <h1 className="text-base sm:text-lg font-semibold text-slate-900">
-                ESSA Loans — Admin Dashboard
-              </h1>
+              <h1 className="text-base sm:text-lg font-semibold text-slate-900">ESSA Loans — Admin Dashboard</h1>
               <div className="text-xs text-slate-500">Updated {lastUpdated}</div>
             </div>
           </div>
           <div className="flex items-center gap-2">
             <button
-              onClick={() => {
-                mutate();
-                mutateKyc();
-              }}
+              onClick={() => setUpdatedAt(Date.now())}
               className="inline-flex items-center gap-2 rounded-lg border px-3 py-1.5 text-sm hover:bg-slate-50"
               title="Refresh"
             >
@@ -250,14 +481,7 @@ export default function AdminDashboardPage() {
         <section>
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
             {cards.map((c) => (
-              <KPICard
-                key={c.label}
-                label={c.label}
-                value={isLoading ? undefined : c.value}
-                sub={c.sub}
-                icon={c.icon}
-                tint={c.tint}
-              />
+              <KPICard key={c.label} label={c.label} value={loansLoading ? undefined : c.value} sub={c.sub} icon={c.icon} tint={c.tint} />
             ))}
           </div>
         </section>
@@ -265,70 +489,54 @@ export default function AdminDashboardPage() {
         {/* Loan Detailed Overview */}
         <section className="rounded-2xl border bg-white p-4 sm:p-6">
           <div className="flex items-center justify-between">
-            <h2 className="text-base sm:text-lg font-semibold text-slate-900">
-              Loan Detailed Overview
-            </h2>
+            <h2 className="text-base sm:text-lg font-semibold text-slate-900">Loan Detailed Overview</h2>
           </div>
 
           <div className="mt-4 grid gap-4 lg:grid-cols-3">
             <div className="rounded-xl border p-4">
               <h3 className="font-medium text-slate-800">By Status</h3>
               <MiniDonut
-                isLoading={isLoading}
-                data={toSegments(derived.statusCounts, {
-                  active: "#22c55e",
-                  overdue: "#ef4444",
-                  closed: "#6b7280",
-                })}
+                isLoading={loansLoading}
+                data={toSegments(breakdown.status || {}, { active: "#22c55e", overdue: "#ef4444", closed: "#6b7280" })}
                 centerLabel="Loans"
               />
-              <Legend items={Object.entries(derived.statusCounts)} />
+              <Legend items={Object.entries(breakdown.status || {})} />
             </div>
 
             <div className="rounded-xl border p-4">
               <h3 className="font-medium text-slate-800">By Type</h3>
               <MiniDonut
-                isLoading={isLoading}
-                data={toSegments(derived.typeCounts, {
-                  business: "#0ea5e9",
-                  payroll: "#a855f7",
-                  unknown: "#94a3b8",
-                })}
+                isLoading={loansLoading}
+                data={toSegments(breakdown.type || {}, { business: "#0ea5e9", payroll: "#a855f7", unknown: "#94a3b8" })}
                 centerLabel="Types"
               />
-              <Legend items={Object.entries(derived.typeCounts)} />
+              <Legend items={Object.entries(breakdown.type || {})} />
             </div>
 
             <div className="grid gap-4">
               <div className="rounded-xl border p-4">
                 <h3 className="font-medium text-slate-800">By Payment Frequency</h3>
-                <BarRow
-                  label="Monthly"
-                  value={derived.freqCounts["monthly"] || 0}
-                  total={sumVals(derived.freqCounts)}
-                />
-                <BarRow
-                  label="Weekly"
-                  value={derived.freqCounts["weekly"] || 0}
-                  total={sumVals(derived.freqCounts)}
-                />
+                <BarRow label="Monthly" value={(breakdown.frequency || {})["monthly"] || 0} total={sumVals(breakdown.frequency || {})} />
+                <BarRow label="Weekly" value={(breakdown.frequency || {})["weekly"] || 0} total={sumVals(breakdown.frequency || {})} />
               </div>
               <div className="rounded-xl border p-4">
                 <h3 className="font-medium text-slate-800">Top Areas</h3>
                 <ul className="mt-2 grid gap-2">
-                  {isLoading && <SkeletonLine count={5} />}
-                  {!isLoading && derived.topAreas.length === 0 && (
-                    <li className="text-sm text-slate-500">No area data.</li>
-                  )}
-                  {!isLoading &&
-                    derived.topAreas.map(([name, count]) => (
-                      <li key={name} className="flex items-center justify-between text-sm">
-                        <span className="text-slate-700">{name}</span>
-                        <span className="rounded-full bg-slate-50 px-2 py-0.5 text-slate-700 border">
-                          {num(count)}
-                        </span>
-                      </li>
-                    ))}
+                  {loansLoading && <SkeletonLine count={5} />}
+                  {!loansLoading &&
+                    Object.entries(
+                      loans.reduce<Record<string, number>>((m, r) => (add(m, r.areaName || "—"), m), {})
+                    )
+                      .sort((a, b) => b[1] - a[1])
+                      .slice(0, 6)
+                      .map(([name, count]) => (
+                        <li key={name} className="flex items-center justify-between text-sm">
+                          <span className="text-slate-700">{name}</span>
+                          <span className="rounded-full bg-slate-50 px-2 py-0.5 text-slate-700 border">
+                            {num(count)}
+                          </span>
+                        </li>
+                      ))}
                 </ul>
               </div>
             </div>
@@ -339,28 +547,16 @@ export default function AdminDashboardPage() {
         <div className="grid gap-4 xl:grid-cols-2">
           <Section title="Outstanding loans (top 6)">
             <ResponsiveTable
-              isLoading={isLoading}
+              isLoading={loansLoading}
               emptyText="No outstanding loans."
               headers={["Applicant", "Balance", "Period", "Area", "End date", ""]}
               rows={outstandingTop.map((r) => [
                 <CellPrimary key="a" title={fullName(r)} subtitle={r.mobile || "—"} />,
-                <span key="b" className="font-medium text-slate-900">
-                  MWK {money(r.currentBalance || 0)}
-                </span>,
-                <span key="c" className="text-slate-700">
-                  {r.loanPeriod} {r.paymentFrequency === "weekly" ? "wk" : "mo"}
-                </span>,
-                <span key="d" className="text-slate-700">
-                  {r.areaName || "—"}
-                </span>,
-                <span key="e" className="text-slate-700">
-                  {fmtDate(r.endDate)}
-                </span>,
-                <a
-                  key="f"
-                  className="inline-flex items-center gap-1 text-blue-700 hover:underline"
-                  href={`/admin/loans/${r.id}`}
-                >
+                <span key="b" className="font-medium text-slate-900">MWK {money(r.currentBalance || 0)}</span>,
+                <span key="c" className="text-slate-700">{r.loanPeriod} {r.paymentFrequency === "weekly" ? "wk" : "mo"}</span>,
+                <span key="d" className="text-slate-700">{r.areaName || "—"}</span>,
+                <span key="e" className="text-slate-700">{fmtDate(r.endDate as any)}</span>,
+                <a key="f" className="inline-flex items-center gap-1 text-blue-700 hover:underline" href={`/admin/loans/${r.id}`}>
                   View <IconArrowRight className="h-3.5 w-3.5" />
                 </a>,
               ])}
@@ -369,15 +565,12 @@ export default function AdminDashboardPage() {
 
           <Section title="Deadlines in next 14 days">
             <ListCards
-              isLoading={isLoading}
+              isLoading={loansLoading}
               emptyText="No deadlines in the next 14 days."
               items={deadlinesUpcoming.map((r) => ({
                 title: fullName(r),
-                chips: [
-                  `MWK ${money(r.currentBalance || 0)}`,
-                  `${r.loanPeriod}${r.paymentFrequency === "weekly" ? "wk" : "mo"}`,
-                ],
-                meta: `${fmtDate(r.endDate)} · ${r.areaName || "—"}`,
+                chips: [`MWK ${money(r.currentBalance || 0)}`, `${r.loanPeriod}${r.paymentFrequency === "weekly" ? "wk" : "mo"}`],
+                meta: `${fmtDate(r.endDate as any)} · ${r.areaName || "—"}`,
                 href: `/admin/loans/${r.id}`,
               }))}
             />
@@ -385,15 +578,12 @@ export default function AdminDashboardPage() {
 
           <Section title="Due for collateral (overdue)">
             <ListCards
-              isLoading={isLoading}
+              isLoading={loansLoading}
               emptyText="No overdue loans with collateral."
               items={overdueWithCollateral.map((r) => ({
                 title: fullName(r),
-                chips: [
-                  `MWK ${money(r.currentBalance || 0)}`,
-                  `${r.collateralItems?.length || 0} item(s)`,
-                ],
-                meta: `Overdue since ${fmtDate(r.endDate)} · ${r.areaName || "—"}`,
+                chips: [`MWK ${money(r.currentBalance || 0)}`, `${r.collateralItems?.length || 0} item(s)`],
+                meta: `Overdue since ${fmtDate(r.endDate as any)} · ${r.areaName || "—"}`,
                 href: `/admin/loans/${r.id}`,
               }))}
             />
@@ -401,7 +591,7 @@ export default function AdminDashboardPage() {
 
           <Section title="Finished repayments">
             <ListCards
-              isLoading={isLoading}
+              isLoading={loansLoading}
               emptyText="No recent finishes."
               items={finished.map((r) => ({
                 title: fullName(r),
@@ -436,19 +626,13 @@ export default function AdminDashboardPage() {
           >
             <div className="grid gap-2">
               {kycLoading && <SkeletonLine count={3} />}
-              {kycError && (
-                <div className="text-sm text-rose-600">Failed to load KYC.</div>
-              )}
+              {kycError && <div className="text-sm text-rose-600">Failed to load KYC.</div>}
               {!kycLoading && !kycError && kycPending.length === 0 && (
                 <div className="text-center text-slate-500">Nothing pending.</div>
               )}
-              {!kycLoading &&
-                !kycError &&
+              {!kycLoading && !kycError &&
                 kycPending.map((k) => (
-                  <div
-                    key={k.id}
-                    className="rounded-xl border bg-white p-3 flex items-start justify-between gap-2"
-                  >
+                  <div key={k.id} className="rounded-xl border bg-white p-3 flex items-start justify-between gap-2">
                     <div>
                       <div className="font-medium text-slate-900">
                         {fullName({ firstName: k.firstName, lastName: k.lastName })}
@@ -461,10 +645,7 @@ export default function AdminDashboardPage() {
                       </div>
                     </div>
                     <div className="flex items-center gap-2">
-                      <a
-                        href={`/admin/kyc/${k.id}`}
-                        className="rounded-lg border px-2.5 py-1.5 text-xs hover:bg-slate-50"
-                      >
+                      <a href={`/admin/kyc/${k.id}`} className="rounded-lg border px-2.5 py-1.5 text-xs hover:bg-slate-50">
                         Open page
                       </a>
                       <button
@@ -483,29 +664,26 @@ export default function AdminDashboardPage() {
 
           <Section title="Recent applicants">
             <ListCards
-              isLoading={isLoading}
+              isLoading={loansLoading}
               emptyText="No recent applications."
               items={recentApplicants.map((r) => ({
                 title: fullName(r),
-                chips: [`MWK ${money(r.loanAmount || 0)}`, r.status ?? "—"],
-                meta: r.timestamp ? new Date(normalizeDate(r.timestamp)).toLocaleString() : "",
+                chips: [`MWK ${money(r.loanAmount || 0)}`, String(r.status ?? "—")],
+                meta: r.timestamp ? new Date(toMillis(r.timestamp) || 0).toLocaleString() : "",
                 href: `/admin/loans/${r.id}`,
               }))}
             />
           </Section>
         </div>
 
+        {(loansError || kycError) && (
+          <div className="text-center text-xs text-rose-600 pt-2">
+            {loansError || kycError}
+          </div>
+        )}
+
         <div className="pt-2 pb-8 text-center text-xs text-slate-500">
-          Dashboard auto-refreshes every 15s ·{" "}
-          <button
-            className="underline"
-            onClick={() => {
-              globalMutate("/api/admin/overview-data");
-              mutateKyc();
-            }}
-          >
-            force refresh
-          </button>
+          Realtime data · No server auth · Client Firestore
         </div>
       </main>
     </div>
@@ -513,7 +691,7 @@ export default function AdminDashboardPage() {
 }
 
 /* =========================================================
-   KYC Preview Modal (fetches /api/admin/kyc?id=...)
+   KYC Preview Modal (client Firestore doc fetch)
    ========================================================= */
 function KycPreviewModal({
   kycId,
@@ -522,11 +700,36 @@ function KycPreviewModal({
   kycId: string | null;
   onClose: () => void;
 }) {
-  const { data, isLoading, error } = useSWR<any>(
-    kycId ? `/api/admin/kyc?id=${encodeURIComponent(kycId)}` : null,
-    jsonFetcher,
-    { revalidateOnFocus: false }
-  );
+  const [data, setData] = useState<any>(null);
+  const [isLoading, setLoading] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const mounted = useRef(false);
+
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
+
+  useEffect(() => {
+    if (!kycId) return;
+    setLoading(true);
+    setErr(null);
+    setData(null);
+
+    (async () => {
+      try {
+        const snap = await getDoc(fsDoc(collection(db, "kyc_data"), kycId));
+        if (!mounted.current) return;
+        if (!snap.exists()) throw new Error("Record not found");
+        setData({ id: snap.id, ...snap.data() });
+        setLoading(false);
+      } catch (e: any) {
+        if (!mounted.current) return;
+        setErr(e?.message || "Failed to load KYC");
+        setLoading(false);
+      }
+    })();
+  }, [kycId]);
 
   if (!kycId) return null;
 
@@ -537,51 +740,28 @@ function KycPreviewModal({
         <div className="rounded-2xl border bg-white shadow-xl">
           <div className="flex items-center justify-between p-4 border-b">
             <h3 className="text-base font-semibold text-slate-900">KYC Preview</h3>
-            <button
-              onClick={onClose}
-              className="rounded-lg border px-2 py-1 text-sm hover:bg-slate-50"
-            >
-              Close
-            </button>
+            <button onClick={onClose} className="rounded-lg border px-2 py-1 text-sm hover:bg-slate-50">Close</button>
           </div>
           <div className="p-4">
             {isLoading && <SkeletonLine count={6} />}
-            {error && <div className="text-rose-600 text-sm">Failed to load KYC.</div>}
-            {!isLoading && !error && (
+            {err && <div className="text-rose-600 text-sm">Failed to load KYC: {err}</div>}
+            {!isLoading && !err && (
               <div className="grid gap-2 text-sm">
-                <KV
-                  label="Name"
-                  value={
-                    [data?.title, data?.firstName, data?.lastName]
-                      .filter(Boolean)
-                      .join(" ") || "—"
-                  }
-                />
+                <KV label="Name" value={[data?.title, data?.firstName, data?.lastName].filter(Boolean).join(" ") || "—"} />
                 <KV label="ID Number" value={data?.idNumber || "—"} />
                 <KV label="Gender" value={data?.gender || "—"} />
                 <KV label="Date of Birth" value={fmtMaybeDate(data?.dateOfBirth)} />
                 <KV label="Email" value={data?.email1 || data?.email || "—"} />
                 <KV label="Mobile" value={data?.mobileTel1 || data?.mobile || "—"} />
-                <KV
-                  label="Address / City"
-                  value={data?.physicalAddress || data?.physicalCity || data?.areaName || "—"}
-                />
+                <KV label="Address / City" value={data?.physicalAddress || data?.physicalCity || data?.areaName || "—"} />
                 <KV label="Employer" value={data?.employer || "—"} />
                 <KV label="Dependants" value={String(data?.dependants ?? "—")} />
-                <KV
-                  label="Next of Kin"
-                  value={`${data?.familyName || "—"} (${
-                    data?.familyRelation || "—"
-                  })${data?.familyMobile ? " · " + data?.familyMobile : ""}`}
-                />
+                <KV label="Next of Kin" value={`${data?.familyName || "—"} (${data?.familyRelation || "—"})${data?.familyMobile ? " · " + data?.familyMobile : ""}`} />
               </div>
             )}
           </div>
           <div className="p-4 border-t text-right">
-            <a
-              href={`/admin/kyc/${kycId}`}
-              className="inline-flex items-center rounded-lg bg-blue-600 text-white px-3 py-1.5 text-sm hover:bg-blue-700"
-            >
+            <a href={`/admin/kyc/${kycId}`} className="inline-flex items-center rounded-lg bg-blue-600 text-white px-3 py-1.5 text-sm hover:bg-blue-700">
               Open Full KYC
             </a>
           </div>
@@ -620,9 +800,7 @@ function KPICard({
     <div className="rounded-2xl border bg-white p-4 shadow-sm">
       <div className="flex items-start justify-between">
         <div className="text-sm text-slate-600">{label}</div>
-        <div
-          className={`h-9 w-9 shrink-0 rounded-lg bg-gradient-to-br ${tint} text-white grid place-items-center`}
-        >
+        <div className={`h-9 w-9 shrink-0 rounded-lg bg-gradient-to-br ${tint} text-white grid place-items-center`}>
           <Icon className="h-4 w-4" />
         </div>
       </div>
@@ -676,55 +854,36 @@ function ResponsiveTable({
           <thead className="bg-slate-50 text-slate-600 sticky top-0">
             <tr>
               {headers.map((h) => (
-                <th key={h} className="text-left font-medium p-3 whitespace-nowrap">
-                  {h}
-                </th>
+                <th key={h} className="text-left font-medium p-3 whitespace-nowrap">{h}</th>
               ))}
             </tr>
           </thead>
           <tbody className="bg-white">
             {isLoading && (
-              <tr>
-                <td className="p-6 text-center text-slate-500" colSpan={headers.length}>
-                  Loading…
-                </td>
-              </tr>
+              <tr><td className="p-6 text-center text-slate-500" colSpan={headers.length}>Loading…</td></tr>
             )}
             {!isLoading && rows.length === 0 && (
-              <tr>
-                <td className="p-6 text-center text-slate-500" colSpan={headers.length}>
-                  {emptyText}
-                </td>
-              </tr>
+              <tr><td className="p-6 text-center text-slate-500" colSpan={headers.length}>{emptyText}</td></tr>
             )}
-            {!isLoading &&
-              rows.map((r, i) => (
-                <tr key={i} className="border-t">
-                  {r.map((c, j) => (
-                    <td key={j} className="p-3 align-middle whitespace-nowrap">
-                      {c}
-                    </td>
-                  ))}
-                </tr>
-              ))}
+            {!isLoading && rows.map((r, i) => (
+              <tr key={i} className="border-t">
+                {r.map((c, j) => (
+                  <td key={j} className="p-3 align-middle whitespace-nowrap">{c}</td>
+                ))}
+              </tr>
+            ))}
           </tbody>
         </table>
       </div>
 
       <div className="md:hidden grid gap-3">
         {isLoading && <div className="text-center text-slate-500">Loading…</div>}
-        {!isLoading && rows.length === 0 && (
-          <div className="text-center text-slate-500">{emptyText}</div>
-        )}
-        {!isLoading &&
-          rows.length > 0 &&
-          rows.map((r, i) => (
-            <div key={i} className="rounded-xl border bg-white p-3 grid gap-1">
-              {r.map((c, j) => (
-                <div key={j}>{c}</div>
-              ))}
-            </div>
-          ))}
+        {!isLoading && rows.length === 0 && <div className="text-center text-slate-500">{emptyText}</div>}
+        {!isLoading && rows.length > 0 && rows.map((r, i) => (
+          <div key={i} className="rounded-xl border bg-white p-3 grid gap-1">
+            {r.map((c, j) => <div key={j}>{c}</div>)}
+          </div>
+        ))}
       </div>
     </>
   );
@@ -742,32 +901,22 @@ function ListCards({
   return (
     <div className="grid gap-2">
       {isLoading && <SkeletonLine count={3} />}
-      {!isLoading && items.length === 0 && (
-        <div className="text-center text-slate-500">{emptyText}</div>
-      )}
-      {!isLoading &&
-        items.map((it, i) => (
-          <a
-            key={i}
-            href={it.href}
-            className="rounded-xl border hover:bg-slate-50 transition bg-white p-3 flex items-start justify-between gap-2"
-          >
-            <div>
-              <div className="font-medium text-slate-900">{it.title}</div>
-              {!!it.meta && <div className="text-xs text-slate-500 mt-0.5">{it.meta}</div>}
-            </div>
-            <div className="flex flex-wrap items-center justify-end gap-1">
-              {(it.chips || []).map((c) => (
-                <span
-                  key={c}
-                  className="inline-flex items-center rounded-full px-2 py-0.5 text-xs border bg-slate-50 text-slate-700"
-                >
-                  {c}
-                </span>
-              ))}
-            </div>
-          </a>
-        ))}
+      {!isLoading && items.length === 0 && <div className="text-center text-slate-500">{emptyText}</div>}
+      {!isLoading && items.map((it, i) => (
+        <a key={i} href={it.href} className="rounded-xl border hover:bg-slate-50 transition bg-white p-3 flex items-start justify-between gap-2">
+          <div>
+            <div className="font-medium text-slate-900">{it.title}</div>
+            {!!it.meta && <div className="text-xs text-slate-500 mt-0.5">{it.meta}</div>}
+          </div>
+          <div className="flex flex-wrap items-center justify-end gap-1">
+            {(it.chips || []).map((c) => (
+              <span key={c} className="inline-flex items-center rounded-full px-2 py-0.5 text-xs border bg-slate-50 text-slate-700">
+                {c}
+              </span>
+            ))}
+          </div>
+        </a>
+      ))}
     </div>
   );
 }
@@ -781,7 +930,6 @@ function CellPrimary({ title, subtitle }: { title: string; subtitle?: string }) 
   );
 }
 
-/* ===== Mini visuals (no chart libs) ===== */
 function MiniDonut({
   isLoading,
   data,
@@ -796,21 +944,14 @@ function MiniDonut({
 
   return (
     <div className="mt-2 flex items-center gap-4">
-      <div
-        className="relative h-28 w-28 shrink-0 rounded-full"
-        style={{ backgroundImage: css }}
-        aria-label="donut chart"
-        role="img"
-      >
+      <div className="relative h-28 w-28 shrink-0 rounded-full" style={{ backgroundImage: css }} aria-label="donut chart" role="img">
         <div className="absolute inset-2 rounded-full bg-white grid place-items-center">
           {isLoading ? (
             <div className="h-4 w-10 rounded bg-slate-200 animate-pulse" />
           ) : (
             <div className="text-center">
               <div className="text-xs text-slate-500">{centerLabel}</div>
-              <div className="text-sm font-semibold text-slate-900 tabular-nums">
-                {num(total)}
-              </div>
+              <div className="text-sm font-semibold text-slate-900 tabular-nums">{num(total)}</div>
             </div>
           )}
         </div>
@@ -848,10 +989,7 @@ function BarRow({ label, value, total }: { label: string; value: number; total: 
         <span className="tabular-nums text-slate-900">{pct}%</span>
       </div>
       <div className="mt-1 h-2 w-full rounded-full bg-slate-100">
-        <div
-          className="h-2 rounded-full bg-gradient-to-r from-blue-500 to-indigo-500"
-          style={{ width: `${pct}%` }}
-        />
+        <div className="h-2 rounded-full bg-gradient-to-r from-blue-500 to-indigo-500" style={{ width: `${pct}%` }} />
       </div>
     </div>
   );
@@ -871,148 +1009,44 @@ function SkeletonLine({ count = 3 }: { count?: number }) {
 function IconRefresh(props: React.SVGProps<SVGSVGElement>) {
   return (
     <svg viewBox="0 0 24 24" fill="none" {...props}>
-      <path
-        d="M4 4v6h6M20 20v-6h-6M20 10a8 8 0 0 0-14.9-3M4 14a8 8 0 0 0 14.9 3"
-        stroke="currentColor"
-        strokeWidth="2"
-        strokeLinecap="round"
-      />
+      <path d="M4 4v6h6M20 20v-6h-6M20 10a8 8 0 0 0-14.9-3M4 14a8 8 0 0 0 14.9 3" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/>
     </svg>
   );
 }
 function IconClipboard(props: React.SVGProps<SVGSVGElement>) {
   return (
     <svg viewBox="0 0 24 24" fill="none" {...props}>
-      <rect x="6" y="4" width="12" height="16" rx="2" stroke="currentColor" strokeWidth="2" />
-      <path d="M9 4h6v2H9z" fill="currentColor" />
+      <rect x="6" y="4" width="12" height="16" rx="2" stroke="currentColor" strokeWidth="2"/>
+      <path d="M9 4h6v2H9z" fill="currentColor"/>
     </svg>
   );
 }
 function IconCash(props: React.SVGProps<SVGSVGElement>) {
   return (
     <svg viewBox="0 0 24 24" fill="none" {...props}>
-      <rect x="3" y="6" width="18" height="12" rx="2" stroke="currentColor" strokeWidth="2" />
-      <circle cx="12" cy="12" r="2.5" stroke="currentColor" strokeWidth="2" />
+      <rect x="3" y="6" width="18" height="12" rx="2" stroke="currentColor" strokeWidth="2"/>
+      <circle cx="12" cy="12" r="2.5" stroke="currentColor" strokeWidth="2"/>
     </svg>
   );
 }
 function IconShield(props: React.SVGProps<SVGSVGElement>) {
   return (
     <svg viewBox="0 0 24 24" fill="none" {...props}>
-      <path
-        d="M12 3l7 3v5c0 5-3.5 8-7 10-3.5-2-7-5-7-10V6l7-3z"
-        stroke="currentColor"
-        strokeWidth="2"
-      />
+      <path d="M12 3l7 3v5c0 5-3.5 8-7 10-3.5-2-7-5-7-10V6l7-3z" stroke="currentColor" strokeWidth="2"/>
     </svg>
   );
 }
 function IconCheck(props: React.SVGProps<SVGSVGElement>) {
   return (
     <svg viewBox="0 0 24 24" fill="none" {...props}>
-      <path d="M20 6L9 17l-5-5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+      <path d="M20 6L9 17l-5-5" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/>
     </svg>
   );
 }
 function IconArrowRight(props: React.SVGProps<SVGSVGElement>) {
   return (
     <svg viewBox="0 0 24 24" fill="none" {...props}>
-      <path d="M5 12h14M13 5l7 7-7 7" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+      <path d="M5 12h14M13 5l7 7-7 7" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/>
     </svg>
   );
-}
-
-/* =========================================================
-   utils
-   ========================================================= */
-type Nameable = { title?: string; firstName?: string; surname?: string; lastName?: string };
-
-function fullName(r: Nameable) {
-  const last = r.surname ?? r.lastName;
-  return [r.title, r.firstName, last].filter(Boolean).join(" ") || "—";
-}
-
-function normalizeDate(d: string | number | Date | FireTimestamp): number {
-  if (typeof d === "number") return d;
-  if (typeof d === "string") return Date.parse(d);
-  if (d instanceof Date) return d.getTime();
-  if (typeof d === "object" && d && "seconds" in d) return (d as FireTimestamp).seconds * 1000;
-  return NaN;
-}
-
-function fmtDate(d?: string | number | Date | null) {
-  if (!d) return "—";
-  const date = typeof d === "string" || typeof d === "number" ? new Date(d) : d;
-  if (!(date instanceof Date) || isNaN(date.getTime())) return "—";
-  return date.toLocaleDateString();
-}
-
-function fmtMaybeDate(v: any) {
-  if (!v) return "—";
-  try {
-    if (typeof v?.toDate === "function") return v.toDate().toLocaleDateString();
-    if (typeof v?.seconds === "number") return new Date(v.seconds * 1000).toLocaleDateString();
-    const d = new Date(v);
-    return isNaN(d.getTime()) ? "—" : d.toLocaleDateString();
-  } catch {
-    return "—";
-  }
-}
-
-function money(n: number) {
-  try {
-    return new Intl.NumberFormat().format(Math.round(n));
-  } catch {
-    return String(n);
-  }
-}
-function num(n?: number) {
-  try {
-    return new Intl.NumberFormat().format(n || 0);
-  } catch {
-    return String(n || 0);
-  }
-}
-function timeAgo(d: Date) {
-  const s = Math.floor((Date.now() - d.getTime()) / 1000);
-  if (s < 60) return `${s}s ago`;
-  const m = Math.floor(s / 60);
-  if (m < 60) return `${m}m ago`;
-  const h = Math.floor(m / 60);
-  if (h < 24) return `${h}h ago`;
-  const days = Math.floor(h / 24);
-  return `${days}d ago`;
-}
-function add(obj: Record<string, number>, key: string, inc = 1) {
-  obj[key] = (obj[key] || 0) + inc;
-}
-function sumVals(obj: Record<string, number>) {
-  return Object.values(obj).reduce((s, v) => s + v, 0);
-}
-function toSegments(
-  map: Record<string, number>,
-  palette: Record<string, string>
-): Array<{ label: string; value: number; color: string }> {
-  return Object.entries(map).map(([label, value]) => ({
-    label,
-    value,
-    color: palette[label] || pickColor(label),
-  }));
-}
-function pickColor(seed: string) {
-  const colors = ["#0ea5e9", "#6366f1", "#a855f7", "#22c55e", "#f59e0b", "#ef4444", "#14b8a6"];
-  let h = 0;
-  for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) >>> 0;
-  return colors[h % colors.length];
-}
-function conicCSS(data: Array<{ value: number; color: string }>) {
-  const total = Math.max(1, data.reduce((s, d) => s + d.value, 0));
-  let acc = 0;
-  const stops = data.map((d) => {
-    const start = (acc / total) * 360;
-    acc += d.value;
-    const end = (acc / total) * 360;
-    return `${d.color} ${start}deg ${end}deg`;
-  });
-  return `conic-gradient(${stops.join(",")})`;
 }

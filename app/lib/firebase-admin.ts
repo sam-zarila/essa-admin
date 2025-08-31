@@ -1,32 +1,84 @@
 // app/lib/firebase-admin.ts
 import admin from "firebase-admin";
-import path from "path";
 import fs from "fs";
+import path from "path";
 
-let app: admin.app.App | null = null;
-
-function loadServiceAccount(): admin.credential.Credential {
-  try {
-    const p = path.join(process.cwd(), "service-account.json"); // relative path
-    const json = JSON.parse(fs.readFileSync(p, "utf8"));
-    return admin.credential.cert(json as admin.ServiceAccount);
-  } catch (e) {
-    // Fallback if file missing – will work if env/ADC is configured
-    return admin.credential.applicationDefault();
-  }
+// Keep a single app instance in dev/hot-reload
+declare global {
+  // eslint-disable-next-line no-var
+  var __FIREBASE_ADMIN__: admin.app.App | undefined;
 }
 
-export function adminApp() {
-  if (app) return app;
-  if (admin.apps.length) app = admin.app();
-  else {
-    app = admin.initializeApp({
-      credential: loadServiceAccount(),
+type ServiceAccountJson = {
+  project_id: string;
+  client_email: string;
+  private_key: string;
+  // other fields are fine, we only require the three above
+};
+
+function loadServiceAccount(): ServiceAccountJson {
+  // Try a few common relative spots (project root preferred)
+  const candidates = [
+    path.join(process.cwd(), "service-account.json"),
+    path.join(process.cwd(), "./service-account.json"),
+    path.join(process.cwd(), "app", "service-account.json"),
+  ];
+
+  let lastErr: unknown = null;
+  for (const p of candidates) {
+    try {
+      const raw = fs.readFileSync(p, "utf8");
+      const json = JSON.parse(raw);
+
+      if (typeof json?.private_key === "string") {
+        // Fix escaped newlines common in env/file copies
+        json.private_key = json.private_key.replace(/\\n/g, "\n");
+      }
+
+      if (!json?.project_id || !json?.client_email || !json?.private_key) {
+        throw new Error(`Invalid key (missing project_id/client_email/private_key) at ${p}`);
+      }
+
+      // Helpful log to confirm which project we’re using
+      console.log(`[firebase-admin] Loaded service-account from ${p} (project_id=${json.project_id})`);
+      return json as ServiceAccountJson;
+    } catch (e) {
+      lastErr = e;
+      // try next candidate
+    }
+  }
+
+  // Hard fail — better than silently using ADC and getting UNAUTHENTICATED
+  throw new Error(
+    `[firebase-admin] service-account.json not found or invalid near project root. Last error: ${String(
+      lastErr
+    )}`
+  );
+}
+
+function getAdminApp(): admin.app.App {
+  if (global.__FIREBASE_ADMIN__) return global.__FIREBASE_ADMIN__;
+
+  if (!admin.apps.length) {
+    const svc = loadServiceAccount();
+
+    admin.initializeApp({
+      credential: admin.credential.cert({
+        projectId: svc.project_id,
+        clientEmail: svc.client_email,
+        privateKey: svc.private_key,
+      }),
     });
   }
-  return app;
+
+  global.__FIREBASE_ADMIN__ = admin.app();
+  return global.__FIREBASE_ADMIN__;
 }
 
 export function adminDb() {
-  return adminApp().firestore();
+  return getAdminApp().firestore();
+}
+
+export function adminAuth() {
+  return getAdminApp().auth();
 }
