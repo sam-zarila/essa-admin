@@ -3,6 +3,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import type React from "react";
+import Link from "next/link";
 import {
   collection,
   doc as fsDoc,
@@ -15,7 +16,6 @@ import {
   getDocs,
 } from "firebase/firestore";
 import { db } from "../lib/firebase";
-
 
 /* =========================================================
    Types
@@ -68,16 +68,80 @@ type KycRow = {
 /* =========================================================
    Helpers
    ========================================================= */
+function isFirestoreTs(v: any): v is Timestamp {
+  return !!v && typeof v.toDate === "function";
+}
 function toMillis(v: any): number | null {
   try {
     if (!v) return null;
     if (v instanceof Date) return v.getTime();
-    if (typeof v === "number") return v;
-    if (typeof v === "string") return Date.parse(v);
-    if (typeof v === "object" && "seconds" in v) return v.seconds * 1000;
-    if (typeof v?.toDate === "function") return (v as Timestamp).toDate().getTime();
+    if (typeof v === "number") return isFinite(v) ? v : null;
+    if (typeof v === "string") {
+      const n = Date.parse(v);
+      return isFinite(n) ? n : null;
+    }
+    if (isFirestoreTs(v)) return v.toDate().getTime();
+    if (typeof v === "object" && "seconds" in v && typeof v.seconds === "number") {
+      return Math.round(v.seconds * 1000);
+    }
   } catch {}
   return null;
+}
+
+/** Safe nested getter like "name.first" */
+function g(obj: any, path: string) {
+  return path.split(".").reduce((v, k) => (v == null ? v : v[k]), obj);
+}
+
+/** Extract first/last name + area from ANY common schema variants */
+function extractNameArea(v: any): { first?: string; last?: string; area?: string } {
+  const firstCandidates = [
+    "firstName",
+    "applicantFirstName",
+    "givenName",
+    "fname",
+    "first_name",
+    "name.first",
+    "applicant.name.first",
+  ];
+  const lastCandidates = [
+    "surname",
+    "lastName",
+    "applicantLastName",
+    "familyName",
+    "lname",
+    "last_name",
+    "name.last",
+    "applicant.name.last",
+  ];
+  const areaCandidates = [
+    "areaName",
+    "physicalCity",
+    "city",
+    "addressCity",
+    "address.city",
+    "location.city",
+    "town",
+    "village",
+    "area",
+    "district",
+  ];
+
+  const first = firstCandidates.map((k) => g(v, k)).find(Boolean);
+  const last = lastCandidates.map((k) => g(v, k)).find(Boolean);
+
+  let area = areaCandidates.map((k) => g(v, k)).find(Boolean) as string | undefined;
+
+  // Fallback: single "name" string like "John Banda"
+  if (!first && !last && typeof v?.name === "string" && v.name.trim()) {
+    const parts = v.name.trim().split(/\s+/);
+    if (parts.length >= 2) {
+      return { first: parts.slice(0, -1).join(" "), last: parts.slice(-1)[0], area };
+    }
+    return { first: v.name.trim(), last: undefined, area };
+  }
+
+  return { first, last, area };
 }
 
 function computeEndDate(
@@ -108,11 +172,13 @@ function fmtMaybeDate(v: any) {
   const ms = toMillis(v);
   return ms ? new Date(ms).toLocaleDateString() : "—";
 }
-function money(n: number) {
-  try { return new Intl.NumberFormat().format(Math.round(n)); } catch { return String(n); }
+function money(n?: number) {
+  const safe = typeof n === "number" && isFinite(n) ? Math.round(n) : 0;
+  try { return new Intl.NumberFormat().format(safe); } catch { return String(safe); }
 }
 function num(n?: number) {
-  try { return new Intl.NumberFormat().format(n || 0); } catch { return String(n || 0); }
+  const safe = typeof n === "number" && isFinite(n) ? n : 0;
+  try { return new Intl.NumberFormat().format(safe); } catch { return String(safe); }
 }
 function timeAgo(d: Date) {
   const s = Math.floor((Date.now() - d.getTime()) / 1000);
@@ -130,6 +196,11 @@ function add(obj: Record<string, number>, key: string, inc = 1) {
 function sumVals(obj: Record<string, number>) {
   return Object.values(obj).reduce((s, v) => s + v, 0);
 }
+function normalizeStatus(s?: string) {
+  const k = String(s || "pending").toLowerCase();
+  if (k === "finished" || k === "complete" || k === "completed") return "closed";
+  return k;
+}
 function toSegments(
   map: Record<string, number>,
   palette: Record<string, string>
@@ -143,7 +214,7 @@ function toSegments(
 function pickColor(seed: string) {
   const colors = ["#0ea5e9", "#6366f1", "#a855f7", "#22c55e", "#f59e0b", "#ef4444", "#14b8a6"];
   let h = 0;
-  for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) >>> 0;
+  for (let i = 0; i < (seed || "").length; i++) h = (h * 31 + seed.charCodeAt(i)) >>> 0;
   return colors[h % colors.length];
 }
 function conicCSS(data: Array<{ value: number; color: string }>) {
@@ -157,6 +228,24 @@ function conicCSS(data: Array<{ value: number; color: string }>) {
   });
   return `conic-gradient(${stops.join(",")})`;
 }
+
+/* Palettes */
+const STATUS_PALETTE: Record<string, string> = {
+  pending: "#f59e0b",
+  approved: "#0ea5e9",
+  active: "#22c55e",
+  overdue: "#ef4444",
+  closed: "#6b7280",
+  unknown: "#94a3b8",
+};
+const TYPE_PALETTE: Record<string, string> = {
+  business: "#0ea5e9",
+  payroll: "#a855f7",
+  salary: "#6366f1",
+  agriculture: "#22c55e",
+  school: "#f59e0b",
+  unknown: "#94a3b8",
+};
 
 /* =========================================================
    Page
@@ -180,25 +269,36 @@ export default function AdminDashboardPage() {
       (snap) => {
         const rows: Loan[] = snap.docs.map((d) => {
           const v = d.data() as any;
-          const status = String(v.status || "pending").toLowerCase();
+
+          // 🔎 Robust name & area extraction
+          const { first, last, area } = extractNameArea(v);
+
+          const status = normalizeStatus(v.status);
           const paymentFrequency = (v.paymentFrequency ?? "monthly") as "weekly" | "monthly";
           const loanPeriod = Number(v.loanPeriod ?? 0);
           const ts = v.timestamp ?? null;
 
           return {
             id: d.id,
-            firstName: v.firstName ?? v.applicantFirstName ?? "",
-            surname: v.surname ?? v.applicantLastName ?? "",
+            // Names
+            firstName: (first ?? "") as string,
+            surname: (last ?? "") as string,
             title: v.title ?? "",
+            // Contacts
             mobile: v.mobileTel ?? v.mobile ?? v.mobileTel1 ?? "",
+            // Amounts
             loanAmount: Number(v.loanAmount ?? 0),
             currentBalance: Number(v.currentBalance ?? v.loanAmount ?? 0),
+            // Terms
             loanPeriod,
             paymentFrequency,
             status,
+            // Dates
             timestamp: ts,
             endDate: computeEndDate(ts, loanPeriod, paymentFrequency),
-            areaName: v.areaName ?? "",
+            // Area
+            areaName: (area ?? "") as string,
+            // Other
             collateralItems: Array.isArray(v.collateralItems) ? v.collateralItems : [],
             loanType: String(v.loanType || "unknown").toLowerCase(),
           };
@@ -213,14 +313,18 @@ export default function AdminDashboardPage() {
           const snap = await getDocs(query(collection(db, "loan_applications"), fsLimit(200)));
           const rows: Loan[] = snap.docs.map((d) => {
             const v = d.data() as any;
-            const status = String(v.status || "pending").toLowerCase();
+
+            const { first, last, area } = extractNameArea(v);
+
+            const status = normalizeStatus(v.status);
             const paymentFrequency = (v.paymentFrequency ?? "monthly") as "weekly" | "monthly";
             const loanPeriod = Number(v.loanPeriod ?? 0);
             const ts = v.timestamp ?? null;
+
             return {
               id: d.id,
-              firstName: v.firstName ?? v.applicantFirstName ?? "",
-              surname: v.surname ?? v.applicantLastName ?? "",
+              firstName: (first ?? "") as string,
+              surname: (last ?? "") as string,
               title: v.title ?? "",
               mobile: v.mobileTel ?? v.mobile ?? v.mobileTel1 ?? "",
               loanAmount: Number(v.loanAmount ?? 0),
@@ -230,7 +334,7 @@ export default function AdminDashboardPage() {
               status,
               timestamp: ts,
               endDate: computeEndDate(ts, loanPeriod, paymentFrequency),
-              areaName: v.areaName ?? "",
+              areaName: (area ?? "") as string,
               collateralItems: Array.isArray(v.collateralItems) ? v.collateralItems : [],
               loanType: String(v.loanType || "unknown").toLowerCase(),
             };
@@ -280,7 +384,7 @@ export default function AdminDashboardPage() {
         setKycLoading(false);
       },
       async () => {
-        // fallback: try timestamp
+        // fallback: try timestamp, then simple limit
         try {
           const q2 = query(base, orderBy("timestamp", "desc"), fsLimit(100));
           const snap = await getDocs(q2);
@@ -300,7 +404,6 @@ export default function AdminDashboardPage() {
           setKycPending(rows);
           setKycLoading(false);
         } catch (e) {
-          // ultimate fallback: simple limit
           try {
             const snap = await getDocs(query(base, fsLimit(100)));
             const rows = snap.docs.map((d) => {
@@ -342,8 +445,14 @@ export default function AdminDashboardPage() {
     [loans]
   );
   const outstandingTop = useMemo(() => outstanding.slice(0, 6), [outstanding]);
-  const now = new Date();
-  const soon = new Date(Date.now() + 14 * 24 * 60 * 60 * 1000);
+
+  // Re-evaluate the rolling 14-day window whenever data is refreshed
+  const now = useMemo(() => new Date(), [updatedAt]);
+  const soon = useMemo(
+    () => new Date((updatedAt ?? Date.now()) + 14 * 24 * 60 * 60 * 1000),
+    [updatedAt]
+  );
+
   const deadlinesUpcoming = useMemo(
     () =>
       loans
@@ -357,10 +466,15 @@ export default function AdminDashboardPage() {
             end <= soon
           );
         })
-        .sort((a, b) => new Date(a.endDate || 0).getTime() - new Date(b.endDate || 0).getTime())
+        .sort(
+          (a, b) =>
+            new Date(a.endDate || 0).getTime() -
+            new Date(b.endDate || 0).getTime()
+        )
         .slice(0, 8),
-    [loans]
+    [loans, now, soon]
   );
+
   const overdueWithCollateral = useMemo(
     () =>
       loans
@@ -374,10 +488,15 @@ export default function AdminDashboardPage() {
             (r.collateralItems?.length ?? 0) > 0
           );
         })
-        .sort((a, b) => new Date(a.endDate || 0).getTime() - new Date(b.endDate || 0).getTime())
+        .sort(
+          (a, b) =>
+            new Date(a.endDate || 0).getTime() -
+            new Date(b.endDate || 0).getTime()
+        )
         .slice(0, 8),
-    [loans]
+    [loans, now]
   );
+
   const finished = useMemo(
     () =>
       loans
@@ -395,15 +514,21 @@ export default function AdminDashboardPage() {
   const totals: Totals = useMemo(
     () => ({
       outstandingCount: outstanding.length,
-      outstandingBalanceSum: outstanding.reduce((s, r) => s + (r.currentBalance || 0), 0),
-      collateralCount: loans.reduce((s, r) => s + (r.collateralItems?.length ?? 0), 0),
+      outstandingBalanceSum: outstanding.reduce(
+        (s, r) => s + (r.currentBalance || 0),
+        0
+      ),
+      collateralCount: loans.reduce(
+        (s, r) => s + (r.collateralItems?.length ?? 0),
+        0
+      ),
       finishedCount: finished.length,
       overdueCount: loans.filter((r) => {
         const end = r.endDate ? new Date(r.endDate) : null;
         return end && end < now && (r.currentBalance ?? 0) > 0;
       }).length,
     }),
-    [loans, outstanding, finished]
+    [loans, outstanding, finished, now]
   );
 
   const breakdown: Breakdown = useMemo(() => {
@@ -411,7 +536,7 @@ export default function AdminDashboardPage() {
     const type: Record<string, number> = {};
     const frequency: Record<string, number> = {};
     loans.forEach((r) => {
-      add(status, String(r.status || "pending").toLowerCase());
+      add(status, normalizeStatus(r.status));
       add(type, String(r.loanType || "unknown").toLowerCase());
       add(frequency, String(r.paymentFrequency || "monthly"));
     });
@@ -433,22 +558,50 @@ export default function AdminDashboardPage() {
     }, 0);
     setKycNewCount(count);
   }, [kycPending]);
-
   function markKycSeen() {
     localStorage.setItem("kyc_seen_at", String(Date.now()));
     setKycNewCount(0);
   }
 
-  // ---------- Modal state ----------
+  // ---------- Modals ----------
   const [viewKycId, setViewKycId] = useState<string | null>(null);
+  const [viewLoanId, setViewLoanId] = useState<string | null>(null); // NEW
 
   // ---------- Header & KPIs ----------
-  const lastUpdated = updatedAt ? timeAgo(new Date(updatedAt)) : loansLoading ? "—" : "a moment ago";
+  const lastUpdated = updatedAt
+    ? timeAgo(new Date(updatedAt))
+    : loansLoading
+    ? "—"
+    : "a moment ago";
   const cards = [
-    { label: "Outstanding Loans", value: num(totals.outstandingCount), sub: "Active with balance", icon: IconClipboard, tint: "from-amber-500 to-amber-600" },
-    { label: "Outstanding Balance", value: "MWK " + money(totals.outstandingBalanceSum || 0), sub: "Sum of balances", icon: IconCash, tint: "from-rose-500 to-rose-600" },
-    { label: "Collateral Items", value: num(totals.collateralCount), sub: "Across loans", icon: IconShield, tint: "from-indigo-500 to-indigo-600" }, // fixed typo
-    { label: "Finished Repayments", value: num(totals.finishedCount), sub: "Recently closed", icon: IconCheck, tint: "from-emerald-500 to-emerald-600" },
+    {
+      label: "Outstanding Loans",
+      value: num(totals.outstandingCount),
+      sub: "Active with balance",
+      icon: IconClipboard,
+      tint: "from-amber-500 to-amber-600",
+    },
+    {
+      label: "Outstanding Balance",
+      value: "MWK " + money(totals.outstandingBalanceSum || 0),
+      sub: "Sum of balances",
+      icon: IconCash,
+      tint: "from-rose-500 to-rose-600",
+    },
+    {
+      label: "Collateral Items",
+      value: num(totals.collateralCount),
+      sub: "Across loans",
+      icon: IconShield,
+      tint: "from-indigo-500 to-indigo-600",
+    },
+    {
+      label: "Finished Repayments",
+      value: num(totals.finishedCount),
+      sub: "Recently closed",
+      icon: IconCheck,
+      tint: "from-emerald-500 to-emerald-600",
+    },
   ];
 
   return (
@@ -457,9 +610,13 @@ export default function AdminDashboardPage() {
       <header className="sticky top-0 z-20 border-b bg-white/90 backdrop-blur supports-[backdrop-filter]:bg-white/60">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 h-16 flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <div className="h-9 w-9 rounded-lg bg-gradient-to-br from-blue-600 to-indigo-600 text-white grid place-items-center font-semibold">EL</div>
+            <div className="h-9 w-9 rounded-lg bg-gradient-to-br from-blue-600 to-indigo-600 text-white grid place-items-center font-semibold">
+              EL
+            </div>
             <div>
-              <h1 className="text-base sm:text-lg font-semibold text-slate-900">ESSA Loans — Admin Dashboard</h1>
+              <h1 className="text-base sm:text-lg font-semibold text-slate-900">
+                ESSA Loans — Admin Dashboard
+              </h1>
               <div className="text-xs text-slate-500">Updated {lastUpdated}</div>
             </div>
           </div>
@@ -481,7 +638,14 @@ export default function AdminDashboardPage() {
         <section>
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
             {cards.map((c) => (
-              <KPICard key={c.label} label={c.label} value={loansLoading ? undefined : c.value} sub={c.sub} icon={c.icon} tint={c.tint} />
+              <KPICard
+                key={c.label}
+                label={c.label}
+                value={loansLoading ? undefined : c.value}
+                sub={c.sub}
+                icon={c.icon}
+                tint={c.tint}
+              />
             ))}
           </div>
         </section>
@@ -489,7 +653,9 @@ export default function AdminDashboardPage() {
         {/* Loan Detailed Overview */}
         <section className="rounded-2xl border bg-white p-4 sm:p-6">
           <div className="flex items-center justify-between">
-            <h2 className="text-base sm:text-lg font-semibold text-slate-900">Loan Detailed Overview</h2>
+            <h2 className="text-base sm:text-lg font-semibold text-slate-900">
+              Loan Detailed Overview
+            </h2>
           </div>
 
           <div className="mt-4 grid gap-4 lg:grid-cols-3">
@@ -497,7 +663,7 @@ export default function AdminDashboardPage() {
               <h3 className="font-medium text-slate-800">By Status</h3>
               <MiniDonut
                 isLoading={loansLoading}
-                data={toSegments(breakdown.status || {}, { active: "#22c55e", overdue: "#ef4444", closed: "#6b7280" })}
+                data={toSegments(breakdown.status || {}, STATUS_PALETTE)}
                 centerLabel="Loans"
               />
               <Legend items={Object.entries(breakdown.status || {})} />
@@ -507,7 +673,7 @@ export default function AdminDashboardPage() {
               <h3 className="font-medium text-slate-800">By Type</h3>
               <MiniDonut
                 isLoading={loansLoading}
-                data={toSegments(breakdown.type || {}, { business: "#0ea5e9", payroll: "#a855f7", unknown: "#94a3b8" })}
+                data={toSegments(breakdown.type || {}, TYPE_PALETTE)}
                 centerLabel="Types"
               />
               <Legend items={Object.entries(breakdown.type || {})} />
@@ -516,8 +682,16 @@ export default function AdminDashboardPage() {
             <div className="grid gap-4">
               <div className="rounded-xl border p-4">
                 <h3 className="font-medium text-slate-800">By Payment Frequency</h3>
-                <BarRow label="Monthly" value={(breakdown.frequency || {})["monthly"] || 0} total={sumVals(breakdown.frequency || {})} />
-                <BarRow label="Weekly" value={(breakdown.frequency || {})["weekly"] || 0} total={sumVals(breakdown.frequency || {})} />
+                <BarRow
+                  label="Monthly"
+                  value={(breakdown.frequency || {})["monthly"] || 0}
+                  total={sumVals(breakdown.frequency || {})}
+                />
+                <BarRow
+                  label="Weekly"
+                  value={(breakdown.frequency || {})["weekly"] || 0}
+                  total={sumVals(breakdown.frequency || {})}
+                />
               </div>
               <div className="rounded-xl border p-4">
                 <h3 className="font-medium text-slate-800">Top Areas</h3>
@@ -552,13 +726,21 @@ export default function AdminDashboardPage() {
               headers={["Applicant", "Balance", "Period", "Area", "End date", ""]}
               rows={outstandingTop.map((r) => [
                 <CellPrimary key="a" title={fullName(r)} subtitle={r.mobile || "—"} />,
-                <span key="b" className="font-medium text-slate-900">MWK {money(r.currentBalance || 0)}</span>,
-                <span key="c" className="text-slate-700">{r.loanPeriod} {r.paymentFrequency === "weekly" ? "wk" : "mo"}</span>,
+                <span key="b" className="font-medium text-slate-900">
+                  MWK {money(r.currentBalance || 0)}
+                </span>,
+                <span key="c" className="text-slate-700">
+                  {r.loanPeriod} {r.paymentFrequency === "weekly" ? "wk" : "mo"}
+                </span>,
                 <span key="d" className="text-slate-700">{r.areaName || "—"}</span>,
                 <span key="e" className="text-slate-700">{fmtDate(r.endDate as any)}</span>,
-                <a key="f" className="inline-flex items-center gap-1 text-blue-700 hover:underline" href={`/admin/loans/${r.id}`}>
+                <button
+                  key="f"
+                  onClick={() => setViewLoanId(r.id)} // ⬅️ open modal instead of navigating
+                  className="inline-flex items-center gap-1 text-blue-700 hover:underline"
+                >
                   View <IconArrowRight className="h-3.5 w-3.5" />
-                </a>,
+                </button>,
               ])}
             />
           </Section>
@@ -569,9 +751,12 @@ export default function AdminDashboardPage() {
               emptyText="No deadlines in the next 14 days."
               items={deadlinesUpcoming.map((r) => ({
                 title: fullName(r),
-                chips: [`MWK ${money(r.currentBalance || 0)}`, `${r.loanPeriod}${r.paymentFrequency === "weekly" ? "wk" : "mo"}`],
+                chips: [
+                  `MWK ${money(r.currentBalance || 0)}`,
+                  `${r.loanPeriod}${r.paymentFrequency === "weekly" ? "wk" : "mo"}`,
+                ],
                 meta: `${fmtDate(r.endDate as any)} · ${r.areaName || "—"}`,
-                href: `/admin/loans/${r.id}`,
+                onClick: () => setViewLoanId(r.id),
               }))}
             />
           </Section>
@@ -582,9 +767,12 @@ export default function AdminDashboardPage() {
               emptyText="No overdue loans with collateral."
               items={overdueWithCollateral.map((r) => ({
                 title: fullName(r),
-                chips: [`MWK ${money(r.currentBalance || 0)}`, `${r.collateralItems?.length || 0} item(s)`],
+                chips: [
+                  `MWK ${money(r.currentBalance || 0)}`,
+                  `${r.collateralItems?.length || 0} item(s)`,
+                ],
                 meta: `Overdue since ${fmtDate(r.endDate as any)} · ${r.areaName || "—"}`,
-                href: `/admin/loans/${r.id}`,
+                onClick: () => setViewLoanId(r.id),
               }))}
             />
           </Section>
@@ -597,7 +785,7 @@ export default function AdminDashboardPage() {
                 title: fullName(r),
                 chips: ["Paid", `${r.loanPeriod}${r.paymentFrequency === "weekly" ? "wk" : "mo"}`],
                 meta: r.areaName || "—",
-                href: `/admin/loans/${r.id}`,
+                onClick: () => setViewLoanId(r.id),
               }))}
             />
           </Section>
@@ -626,28 +814,40 @@ export default function AdminDashboardPage() {
           >
             <div className="grid gap-2">
               {kycLoading && <SkeletonLine count={3} />}
-              {kycError && <div className="text-sm text-rose-600">Failed to load KYC.</div>}
+              {kycError && (
+                <div className="text-sm text-rose-600">Failed to load KYC.</div>
+              )}
               {!kycLoading && !kycError && kycPending.length === 0 && (
                 <div className="text-center text-slate-500">Nothing pending.</div>
               )}
-              {!kycLoading && !kycError &&
+              {!kycLoading &&
+                !kycError &&
                 kycPending.map((k) => (
-                  <div key={k.id} className="rounded-xl border bg-white p-3 flex items-start justify-between gap-2">
+                  <div
+                    key={k.id}
+                    className="rounded-xl border bg-white p-3 flex items-start justify-between gap-2"
+                  >
                     <div>
                       <div className="font-medium text-slate-900">
                         {fullName({ firstName: k.firstName, lastName: k.lastName })}
                       </div>
                       <div className="text-xs text-slate-500 mt-0.5">
-                        {k.createdAt ? new Date(k.createdAt).toLocaleString() : "—"}
+                        {k.createdAt
+                          ? new Date(k.createdAt).toLocaleString()
+                          : "—"}
                       </div>
                       <div className="text-xs text-slate-600 mt-1">
-                        {(k.mobile || "—")}{k.email ? ` · ${k.email}` : ""}
+                        {(k.mobile || "—")}
+                        {k.email ? ` · ${k.email}` : ""}
                       </div>
                     </div>
                     <div className="flex items-center gap-2">
-                      <a href={`/admin/kyc/${k.id}`} className="rounded-lg border px-2.5 py-1.5 text-xs hover:bg-slate-50">
+                      <Link
+                        href={`/admin/kyc/${k.id}`}
+                        className="rounded-lg border px-2.5 py-1.5 text-xs hover:bg-slate-50"
+                      >
                         Open page
-                      </a>
+                      </Link>
                       <button
                         onClick={() => setViewKycId(k.id)}
                         className="rounded-lg bg-blue-600 text-white px-2.5 py-1.5 text-xs hover:bg-blue-700"
@@ -669,8 +869,10 @@ export default function AdminDashboardPage() {
               items={recentApplicants.map((r) => ({
                 title: fullName(r),
                 chips: [`MWK ${money(r.loanAmount || 0)}`, String(r.status ?? "—")],
-                meta: r.timestamp ? new Date(toMillis(r.timestamp) || 0).toLocaleString() : "",
-                href: `/admin/loans/${r.id}`,
+                meta: r.timestamp
+                  ? new Date(toMillis(r.timestamp) || 0).toLocaleString()
+                  : "",
+                onClick: () => setViewLoanId(r.id),
               }))}
             />
           </Section>
@@ -686,6 +888,158 @@ export default function AdminDashboardPage() {
           Realtime data · No server auth · Client Firestore
         </div>
       </main>
+
+      {/* NEW: Loan modal (fixes "page not found" issue) */}
+      <LoanPreviewModal loanId={viewLoanId} onClose={() => setViewLoanId(null)} />
+    </div>
+  );
+}
+
+/* =========================================================
+   Loan Preview Modal (fetches /loan_applications/{id})
+   ========================================================= */
+function LoanPreviewModal({
+  loanId,
+  onClose,
+}: {
+  loanId: string | null;
+  onClose: () => void;
+}) {
+  const [data, setData] = useState<any>(null);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const mounted = useRef(false);
+
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+
+  // Allow ESC to close
+  useEffect(() => {
+    if (!loanId) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [loanId, onClose]);
+
+  useEffect(() => {
+    if (!loanId) return;
+    setLoading(true);
+    setErr(null);
+    setData(null);
+
+    (async () => {
+      try {
+        const snap = await getDoc(fsDoc(db, "loan_applications", loanId));
+        if (!mounted.current) return;
+        if (!snap.exists()) throw new Error("Loan not found");
+
+        const raw = { id: snap.id, ...snap.data() };
+        const { first, last, area } = extractNameArea(raw);
+        setData({
+          ...raw,
+          __first: first,
+          __last: last,
+          __area: area,
+        });
+      } catch (e: any) {
+        if (!mounted.current) return;
+        setErr(e?.message || "Failed to load loan");
+      } finally {
+        if (mounted.current) setLoading(false);
+      }
+    })();
+  }, [loanId]);
+
+  if (!loanId) return null;
+
+  const ts = data ? toMillis(data.timestamp) : null;
+  const end = data ? toMillis(data.endDate) : null;
+  const full =
+    [data?.title, data?.__first, data?.__last].filter(Boolean).join(" ") || "—";
+  const area =
+    data?.__area ??
+    data?.areaName ??
+    data?.physicalCity ??
+    data?.city ??
+    data?.addressCity ??
+    data?.town ??
+    data?.village ??
+    "—";
+
+  return (
+    <div className="fixed inset-0 z-40">
+      <div className="absolute inset-0 bg-black/40" onClick={onClose} />
+      <div className="absolute inset-x-0 top-10 mx-auto w-[94%] max-w-2xl">
+        <div className="rounded-2xl border bg-white shadow-xl">
+          <div className="flex items-center justify-between p-4 border-b">
+            <h3 className="text-base font-semibold text-slate-900">Loan Preview</h3>
+            <button
+              onClick={onClose}
+              className="rounded-lg border px-2 py-1 text-sm hover:bg-slate-50"
+            >
+              Close
+            </button>
+          </div>
+          <div className="p-4">
+            {loading && <SkeletonLine count={6} />}
+            {err && <div className="text-rose-600 text-sm">Failed to load: {err}</div>}
+            {!loading && !err && data && (
+              <div className="grid gap-2 text-sm">
+                <KV label="Applicant" value={full} />
+                <KV
+                  label="Mobile"
+                  value={data?.mobileTel ?? data?.mobile ?? data?.mobileTel1 ?? "—"}
+                />
+                <KV label="Area" value={area} />
+                <KV label="Status" value={String(data?.status ?? "pending")} />
+                <KV
+                  label="Loan Amount"
+                  value={`MWK ${money(Number(data?.loanAmount ?? 0))}`}
+                />
+                <KV
+                  label="Current Balance"
+                  value={`MWK ${money(Number(data?.currentBalance ?? data?.loanAmount ?? 0))}`}
+                />
+                <KV
+                  label="Period"
+                  value={`${Number(data?.loanPeriod ?? 0)} ${String(
+                    data?.paymentFrequency ?? "monthly"
+                  ) === "weekly" ? "wk" : "mo"}`}
+                />
+                <KV label="Start" value={ts ? new Date(ts).toLocaleString() : "—"} />
+                <KV label="End" value={end ? new Date(end).toLocaleDateString() : "—"} />
+                {Array.isArray(data?.collateralItems) && data.collateralItems.length > 0 && (
+                  <div>
+                    <div className="text-slate-500 mb-1">Collateral</div>
+                    <ul className="list-disc pl-5">
+                      {data.collateralItems.map((it: any, i: number) => (
+                        <li key={i} className="text-sm">
+                          {typeof it === "string" ? it : JSON.stringify(it)}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+          <div className="p-4 border-t text-right">
+            {/* If you later add a detail page, you can link to it here */}
+            <button
+              onClick={onClose}
+              className="inline-flex items-center rounded-lg bg-blue-600 text-white px-3 py-1.5 text-sm hover:bg-blue-700"
+            >
+              Done
+            </button>
+          </div>
+        </div>
+      </div>
     </div>
   );
 }
@@ -707,8 +1061,20 @@ function KycPreviewModal({
 
   useEffect(() => {
     mounted.current = true;
-    return () => { mounted.current = false; };
+    return () => {
+      mounted.current = false;
+    };
   }, []);
+
+  // Allow ESC to close
+  useEffect(() => {
+    if (!kycId) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [kycId, onClose]);
 
   useEffect(() => {
     if (!kycId) return;
@@ -718,7 +1084,7 @@ function KycPreviewModal({
 
     (async () => {
       try {
-        const snap = await getDoc(fsDoc(collection(db, "kyc_data"), kycId));
+        const snap = await getDoc(fsDoc(db, "kyc_data", kycId));
         if (!mounted.current) return;
         if (!snap.exists()) throw new Error("Record not found");
         setData({ id: snap.id, ...snap.data() });
@@ -740,30 +1106,58 @@ function KycPreviewModal({
         <div className="rounded-2xl border bg-white shadow-xl">
           <div className="flex items-center justify-between p-4 border-b">
             <h3 className="text-base font-semibold text-slate-900">KYC Preview</h3>
-            <button onClick={onClose} className="rounded-lg border px-2 py-1 text-sm hover:bg-slate-50">Close</button>
+            <button
+              onClick={onClose}
+              className="rounded-lg border px-2 py-1 text-sm hover:bg-slate-50"
+            >
+              Close
+            </button>
           </div>
           <div className="p-4">
             {isLoading && <SkeletonLine count={6} />}
             {err && <div className="text-rose-600 text-sm">Failed to load KYC: {err}</div>}
             {!isLoading && !err && (
               <div className="grid gap-2 text-sm">
-                <KV label="Name" value={[data?.title, data?.firstName, data?.lastName].filter(Boolean).join(" ") || "—"} />
+                <KV
+                  label="Name"
+                  value={[
+                    data?.title,
+                    data?.firstName ?? data?.applicantFirstName,
+                    data?.lastName ?? data?.surname ?? data?.applicantLastName,
+                  ]
+                    .filter(Boolean)
+                    .join(" ") || "—"}
+                />
                 <KV label="ID Number" value={data?.idNumber || "—"} />
                 <KV label="Gender" value={data?.gender || "—"} />
                 <KV label="Date of Birth" value={fmtMaybeDate(data?.dateOfBirth)} />
                 <KV label="Email" value={data?.email1 || data?.email || "—"} />
-                <KV label="Mobile" value={data?.mobileTel1 || data?.mobile || "—"} />
-                <KV label="Address / City" value={data?.physicalAddress || data?.physicalCity || data?.areaName || "—"} />
+                <KV
+                  label="Mobile"
+                  value={data?.mobileTel1 || data?.mobile || "—"}
+                />
+                <KV
+                  label="Address / City"
+                  value={data?.physicalAddress || data?.physicalCity || data?.areaName || "—"}
+                />
                 <KV label="Employer" value={data?.employer || "—"} />
                 <KV label="Dependants" value={String(data?.dependants ?? "—")} />
-                <KV label="Next of Kin" value={`${data?.familyName || "—"} (${data?.familyRelation || "—"})${data?.familyMobile ? " · " + data?.familyMobile : ""}`} />
+                <KV
+                  label="Next of Kin"
+                  value={`${data?.familyName || "—"} (${
+                    data?.familyRelation || "—"
+                  })${data?.familyMobile ? " · " + data?.familyMobile : ""}`}
+                />
               </div>
             )}
           </div>
           <div className="p-4 border-t text-right">
-            <a href={`/admin/kyc/${kycId}`} className="inline-flex items-center rounded-lg bg-blue-600 text-white px-3 py-1.5 text-sm hover:bg-blue-700">
+            <Link
+              href={`/admin/kyc/${kycId}`}
+              className="inline-flex items-center rounded-lg bg-blue-600 text-white px-3 py-1.5 text-sm hover:bg-blue-700"
+            >
               Open Full KYC
-            </a>
+            </Link>
           </div>
         </div>
       </div>
@@ -854,36 +1248,55 @@ function ResponsiveTable({
           <thead className="bg-slate-50 text-slate-600 sticky top-0">
             <tr>
               {headers.map((h) => (
-                <th key={h} className="text-left font-medium p-3 whitespace-nowrap">{h}</th>
+                <th key={h} className="text-left font-medium p-3 whitespace-nowrap">
+                  {h}
+                </th>
               ))}
             </tr>
           </thead>
           <tbody className="bg-white">
             {isLoading && (
-              <tr><td className="p-6 text-center text-slate-500" colSpan={headers.length}>Loading…</td></tr>
+              <tr>
+                <td className="p-6 text-center text-slate-500" colSpan={headers.length}>
+                  Loading…
+                </td>
+              </tr>
             )}
             {!isLoading && rows.length === 0 && (
-              <tr><td className="p-6 text-center text-slate-500" colSpan={headers.length}>{emptyText}</td></tr>
-            )}
-            {!isLoading && rows.map((r, i) => (
-              <tr key={i} className="border-t">
-                {r.map((c, j) => (
-                  <td key={j} className="p-3 align-middle whitespace-nowrap">{c}</td>
-                ))}
+              <tr>
+                <td className="p-6 text-center text-slate-500" colSpan={headers.length}>
+                  {emptyText}
+                </td>
               </tr>
-            ))}
+            )}
+            {!isLoading &&
+              rows.map((r, i) => (
+                <tr key={i} className="border-t">
+                  {r.map((c, j) => (
+                    <td key={j} className="p-3 align-middle whitespace-nowrap">
+                      {c}
+                    </td>
+                  ))}
+                </tr>
+              ))}
           </tbody>
         </table>
       </div>
 
       <div className="md:hidden grid gap-3">
         {isLoading && <div className="text-center text-slate-500">Loading…</div>}
-        {!isLoading && rows.length === 0 && <div className="text-center text-slate-500">{emptyText}</div>}
-        {!isLoading && rows.length > 0 && rows.map((r, i) => (
-          <div key={i} className="rounded-xl border bg-white p-3 grid gap-1">
-            {r.map((c, j) => <div key={j}>{c}</div>)}
-          </div>
-        ))}
+        {!isLoading && rows.length === 0 && (
+          <div className="text-center text-slate-500">{emptyText}</div>
+        )}
+        {!isLoading &&
+          rows.length > 0 &&
+          rows.map((r, i) => (
+            <div key={i} className="rounded-xl border bg-white p-3 grid gap-1">
+              {r.map((c, j) => (
+                <div key={j}>{c}</div>
+              ))}
+            </div>
+          ))}
       </div>
     </>
   );
@@ -896,27 +1309,67 @@ function ListCards({
 }: {
   isLoading: boolean;
   emptyText: string;
-  items: Array<{ title: string; chips?: string[]; meta?: string; href?: string }>;
+  items: Array<{ title: string; chips?: string[]; meta?: string; href?: string; onClick?: () => void }>;
 }) {
   return (
     <div className="grid gap-2">
       {isLoading && <SkeletonLine count={3} />}
-      {!isLoading && items.length === 0 && <div className="text-center text-slate-500">{emptyText}</div>}
-      {!isLoading && items.map((it, i) => (
-        <a key={i} href={it.href} className="rounded-xl border hover:bg-slate-50 transition bg-white p-3 flex items-start justify-between gap-2">
-          <div>
-            <div className="font-medium text-slate-900">{it.title}</div>
-            {!!it.meta && <div className="text-xs text-slate-500 mt-0.5">{it.meta}</div>}
-          </div>
-          <div className="flex flex-wrap items-center justify-end gap-1">
-            {(it.chips || []).map((c) => (
-              <span key={c} className="inline-flex items-center rounded-full px-2 py-0.5 text-xs border bg-slate-50 text-slate-700">
-                {c}
-              </span>
-            ))}
-          </div>
-        </a>
-      ))}
+      {!isLoading && items.length === 0 && (
+        <div className="text-center text-slate-500">{emptyText}</div>
+      )}
+      {!isLoading &&
+        items.map((it, i) => {
+          const content = (
+            <>
+              <div>
+                <div className="font-medium text-slate-900">{it.title}</div>
+                {!!it.meta && <div className="text-xs text-slate-500 mt-0.5">{it.meta}</div>}
+              </div>
+              <div className="flex flex-wrap items-center justify-end gap-1">
+                {(it.chips || []).map((c) => (
+                  <span
+                    key={c}
+                    className="inline-flex items-center rounded-full px-2 py-0.5 text-xs border bg-slate-50 text-slate-700"
+                  >
+                    {c}
+                  </span>
+                ))}
+              </div>
+            </>
+          );
+
+          if (it.onClick) {
+            return (
+              <button
+                key={i}
+                onClick={it.onClick}
+                className="text-left rounded-xl border hover:bg-slate-50 transition bg-white p-3 flex items-start justify-between gap-2"
+              >
+                {content}
+              </button>
+            );
+          }
+          if (it.href?.startsWith("/")) {
+            return (
+              <Link
+                key={i}
+                href={it.href}
+                className="rounded-xl border hover:bg-slate-50 transition bg-white p-3 flex items-start justify-between gap-2"
+              >
+                {content}
+              </Link>
+            );
+          }
+          return (
+            <a
+              key={i}
+              href={it.href}
+              className="rounded-xl border hover:bg-slate-50 transition bg-white p-3 flex items-start justify-between gap-2"
+            >
+              {content}
+            </a>
+          );
+        })}
     </div>
   );
 }
@@ -944,14 +1397,21 @@ function MiniDonut({
 
   return (
     <div className="mt-2 flex items-center gap-4">
-      <div className="relative h-28 w-28 shrink-0 rounded-full" style={{ backgroundImage: css }} aria-label="donut chart" role="img">
+      <div
+        className="relative h-28 w-28 shrink-0 rounded-full"
+        style={{ backgroundImage: css }}
+        aria-label="donut chart"
+        role="img"
+      >
         <div className="absolute inset-2 rounded-full bg-white grid place-items-center">
           {isLoading ? (
             <div className="h-4 w-10 rounded bg-slate-200 animate-pulse" />
           ) : (
             <div className="text-center">
               <div className="text-xs text-slate-500">{centerLabel}</div>
-              <div className="text-sm font-semibold text-slate-900 tabular-nums">{num(total)}</div>
+              <div className="text-sm font-semibold text-slate-900 tabular-nums">
+                {num(total)}
+              </div>
             </div>
           )}
         </div>
@@ -989,7 +1449,10 @@ function BarRow({ label, value, total }: { label: string; value: number; total: 
         <span className="tabular-nums text-slate-900">{pct}%</span>
       </div>
       <div className="mt-1 h-2 w-full rounded-full bg-slate-100">
-        <div className="h-2 rounded-full bg-gradient-to-r from-blue-500 to-indigo-500" style={{ width: `${pct}%` }} />
+        <div
+          className="h-2 rounded-full bg-gradient-to-r from-blue-500 to-indigo-500"
+          style={{ width: `${pct}%` }}
+        />
       </div>
     </div>
   );
@@ -1009,44 +1472,53 @@ function SkeletonLine({ count = 3 }: { count?: number }) {
 function IconRefresh(props: React.SVGProps<SVGSVGElement>) {
   return (
     <svg viewBox="0 0 24 24" fill="none" {...props}>
-      <path d="M4 4v6h6M20 20v-6h-6M20 10a8 8 0 0 0-14.9-3M4 14a8 8 0 0 0 14.9 3" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/>
+      <path
+        d="M4 4v6h6M20 20v-6h-6M20 10a8 8 0 0 0-14.9-3M4 14a8 8 0 0 0 14.9 3"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+      />
     </svg>
   );
 }
 function IconClipboard(props: React.SVGProps<SVGSVGElement>) {
   return (
     <svg viewBox="0 0 24 24" fill="none" {...props}>
-      <rect x="6" y="4" width="12" height="16" rx="2" stroke="currentColor" strokeWidth="2"/>
-      <path d="M9 4h6v2H9z" fill="currentColor"/>
+      <rect x="6" y="4" width="12" height="16" rx="2" stroke="currentColor" strokeWidth="2" />
+      <path d="M9 4h6v2H9z" fill="currentColor" />
     </svg>
   );
 }
 function IconCash(props: React.SVGProps<SVGSVGElement>) {
   return (
     <svg viewBox="0 0 24 24" fill="none" {...props}>
-      <rect x="3" y="6" width="18" height="12" rx="2" stroke="currentColor" strokeWidth="2"/>
-      <circle cx="12" cy="12" r="2.5" stroke="currentColor" strokeWidth="2"/>
+      <rect x="3" y="6" width="18" height="12" rx="2" stroke="currentColor" strokeWidth="2" />
+      <circle cx="12" cy="12" r="2.5" stroke="currentColor" strokeWidth="2" />
     </svg>
   );
 }
 function IconShield(props: React.SVGProps<SVGSVGElement>) {
   return (
     <svg viewBox="0 0 24 24" fill="none" {...props}>
-      <path d="M12 3l7 3v5c0 5-3.5 8-7 10-3.5-2-7-5-7-10V6l7-3z" stroke="currentColor" strokeWidth="2"/>
+      <path
+        d="M12 3l7 3v5c0 5-3.5 8-7 10-3.5-2-7-5-7-10V6l7-3z"
+        stroke="currentColor"
+        strokeWidth="2"
+      />
     </svg>
   );
 }
 function IconCheck(props: React.SVGProps<SVGSVGElement>) {
   return (
     <svg viewBox="0 0 24 24" fill="none" {...props}>
-      <path d="M20 6L9 17l-5-5" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/>
+      <path d="M20 6L9 17l-5-5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
     </svg>
   );
 }
 function IconArrowRight(props: React.SVGProps<SVGSVGElement>) {
   return (
     <svg viewBox="0 0 24 24" fill="none" {...props}>
-      <path d="M5 12h14M13 5l7 7-7 7" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/>
+      <path d="M5 12h14M13 5l7 7-7 7" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
     </svg>
   );
 }
