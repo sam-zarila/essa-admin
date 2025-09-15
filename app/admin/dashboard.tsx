@@ -63,6 +63,9 @@ type ProcessedLoan = {
   frequency?: "weekly" | "monthly" | string;
   startMs?: number | null;
   endMs?: number | null;
+  /** NEW: used for restore + hide */
+  original?: any;
+  cleared?: boolean;
 };
 
 type Totals = {
@@ -157,6 +160,7 @@ export default function AdminDashboardPage() {
   /* Loans (active) */
   const [loansRaw, setLoansRaw] = useState<Loan[]>([]);
   const [loansLoading, setLoansLoading] = useState(true);
+
   const [loansError, setLoansError] = useState<string | null>(null);
   const [updatedAt, setUpdatedAt] = useState<number | null>(null);
 
@@ -244,7 +248,7 @@ export default function AdminDashboardPage() {
     return () => unsub();
   }, []);
 
-  /* KYC */
+  /* KYC (PERMISSIVE: no orderBy so you'll always see docs) */
   const [kycPending, setKycPending] = useState<KycRow[]>([]);
   const [kycLoading, setKycLoading] = useState(true);
   const [kycError, setKycError] = useState<string | null>(null);
@@ -253,7 +257,8 @@ export default function AdminDashboardPage() {
     setKycLoading(true);
     setKycError(null);
     const base = collection(db, "kyc_data");
-    const q1 = query(base, orderBy("createdAt", "desc"), fsLimit(500));
+    // permissive: do not orderBy so we never filter docs out
+    const q1 = query(base, fsLimit(500));
     const unsub = onSnapshot(
       q1,
       (snap) => {
@@ -261,60 +266,23 @@ export default function AdminDashboardPage() {
           const v = d.data() as any;
           return {
             id: d.id,
-            firstName: v.firstName ?? v.applicantFirstName ?? "",
-            lastName: v.lastName ?? v.applicantLastName ?? "",
-            mobile: v.mobileTel1 ?? v.mobile ?? "",
-            email: v.email1 ?? v.email ?? "",
-            gender: v.gender ?? "",
-            physicalCity: v.physicalCity ?? v.areaName ?? "",
-            createdAt: toMillis(v.createdAt) ?? toMillis(v.timestamp) ?? null,
+            firstName: v.firstName ?? v.applicantFirstName ?? v.givenName ?? "",
+            lastName:  v.lastName  ?? v.applicantLastName  ?? v.surname   ?? "",
+            mobile:    v.mobileTel1 ?? v.mobile ?? v.phone ?? "",
+            email:     v.email1 ?? v.email ?? "",
+            gender:    v.gender ?? "",
+            physicalCity: v.physicalCity ?? v.areaName ?? v.city ?? "",
+            createdAt: toMillis(v.createdAt) ?? toMillis(v.timestamp) ?? toMillis(v.created_at) ?? null,
           } as KycRow;
         });
+        rows.sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
         setKycPending(rows);
         setKycLoading(false);
       },
-      async () => {
-        try {
-          const q2 = query(base, orderBy("timestamp", "desc"), fsLimit(500));
-          const snap = await getDocs(q2);
-          const rows = snap.docs.map((d) => {
-            const v = d.data() as any;
-            return {
-              id: d.id,
-              firstName: v.firstName ?? v.applicantFirstName ?? "",
-              lastName: v.lastName ?? v.applicantLastName ?? "",
-              mobile: v.mobileTel1 ?? v.mobile ?? "",
-              email: v.email1 ?? v.email ?? "",
-              gender: v.gender ?? "",
-              physicalCity: v.physicalCity ?? v.areaName ?? "",
-              createdAt: toMillis(v.createdAt) ?? toMillis(v.timestamp) ?? null,
-            } as KycRow;
-          });
-          setKycPending(rows);
-          setKycLoading(false);
-        } catch (e) {
-          try {
-            const snap = await getDocs(query(base, fsLimit(500)));
-            const rows = snap.docs.map((d) => {
-              const v = d.data() as any;
-              return {
-                id: d.id,
-                firstName: v.firstName ?? v.applicantFirstName ?? "",
-                lastName: v.lastName ?? v.applicantLastName ?? "",
-                mobile: v.mobileTel1 ?? v.mobile ?? "",
-                email: v.email1 ?? v.email ?? "",
-                gender: v.gender ?? "",
-                physicalCity: v.physicalCity ?? v.areaName ?? "",
-                createdAt: toMillis(v.createdAt) ?? toMillis(v.timestamp) ?? null,
-              } as KycRow;
-            });
-            setKycPending(rows);
-            setKycLoading(false);
-          } catch (err: any) {
-            setKycError(err?.message || "Failed to load KYC");
-            setKycLoading(false);
-          }
-        }
+      (e) => {
+        console.error("[kyc:onSnapshot] error", e);
+        setKycError(e?.message || "Failed to load KYC");
+        setKycLoading(false);
       }
     );
     return () => unsub();
@@ -359,7 +327,7 @@ export default function AdminDashboardPage() {
     });
   }, [loansRaw, kycIndex]);
 
-  /* ========= NEW: Processed collection ========= */
+  /* ========= Processed collection ========= */
   const [processed, setProcessed] = useState<ProcessedLoan[]>([]);
   const [processedLoading, setProcessedLoading] = useState(true);
   const [processedError, setProcessedError] = useState<string | null>(null);
@@ -368,7 +336,6 @@ export default function AdminDashboardPage() {
     setProcessedLoading(true);
     setProcessedError(null);
     const base = collection(db, "processed_loans");
-    // Order by processedAt if present; if you create some docs manually without it, fallback still works.
     const qy = query(base, orderBy("processedAt", "desc"), fsLimit(200));
     const unsub = onSnapshot(
       qy,
@@ -389,12 +356,14 @@ export default function AdminDashboardPage() {
             frequency: v.frequency || "monthly",
             startMs: toMillis(v.startMs),
             endMs: toMillis(v.endMs),
+            original: v.original || null,
+            cleared: !!v.cleared,
           };
         });
         setProcessed(rows);
         setProcessedLoading(false);
       },
-      async (err) => {
+      (err) => {
         console.warn("[processed:onSnapshot]", err);
         setProcessedError("Failed to load processed loans");
         setProcessedLoading(false);
@@ -478,6 +447,58 @@ export default function AdminDashboardPage() {
   /* Modals */
   const [viewKycId, setViewKycId] = useState<string | null>(null);
   const [viewLoanId, setViewLoanId] = useState<string | null>(null);
+
+  /* Actions for PROCESSED list */
+  async function considerBackToActive(p: ProcessedLoan) {
+    // Build payload to restore
+    const original = (p as any)?.original;
+    let payload: any;
+    if (original && typeof original === "object" && Object.keys(original).length) {
+      payload = original; // exact original doc
+    } else {
+      // Fallback reconstruction
+      const nameParts = (p.applicantFull || "").trim().split(/\s+/);
+      payload = {
+        title: "",
+        firstName: nameParts.length > 1 ? nameParts.slice(0, -1).join(" ") : nameParts[0] || "",
+        surname: nameParts.length > 1 ? nameParts.slice(-1)[0] : "",
+        mobile: p.mobile || "",
+        email: p.email || "",
+        areaName: p.area || "",
+        loanAmount: p.loanAmount ?? p.currentBalance ?? 0,
+        currentBalance: p.currentBalance ?? p.loanAmount ?? 0,
+        loanPeriod: p.period ?? 0,
+        paymentFrequency: (p.frequency || "monthly").toString().toLowerCase(),
+        timestamp: p.startMs ? new Date(p.startMs) : new Date(),
+        endDate: p.endMs ? new Date(p.endMs) : null,
+        status: p.processedStatus === "approved" ? "approved" : "pending",
+        loanType: "unknown",
+      };
+    }
+
+    try {
+      await setDoc(fsDoc(db, "loan_applications", p.id), payload, { merge: false });
+      await deleteDoc(fsDoc(db, "processed_loans", p.id));
+    } catch (e: any) {
+      alert(`Failed to restore: ${e?.message || e}`);
+    }
+  }
+
+  async function clearProcessed(p: ProcessedLoan) {
+    try {
+      await updateDoc(fsDoc(db, "processed_loans", p.id), { cleared: true, clearedAt: Date.now() });
+    } catch (e: any) {
+      alert(`Failed to clear: ${e?.message || e}`);
+    }
+  }
+
+  async function deleteProcessedForever(p: ProcessedLoan) {
+    try {
+      await deleteDoc(fsDoc(db, "processed_loans", p.id));
+    } catch (e: any) {
+      alert(`Failed to delete: ${e?.message || e}`);
+    }
+  }
 
   /* Header & KPIs */
   const lastUpdated = updatedAt ? timeAgo(new Date(updatedAt)) : loansLoading ? "—" : "a moment ago";
@@ -657,46 +678,77 @@ export default function AdminDashboardPage() {
             <KycPreviewModal kycId={viewKycId} onClose={() => setViewKycId(null)} />
           </Section>
 
-          {/* ========= NEW: Processed ========= */}
+          {/* ========= Processed ========= */}
           <Section title="Processed">
             <div className="grid gap-2">
               {processedLoading && <SkeletonLine count={3} />}
               {processedError && <div className="text-sm text-rose-600">{processedError}</div>}
-              {!processedLoading && !processedError && processed.length === 0 && (
+              {!processedLoading && !processedError && processed.filter(p => !p.cleared).length === 0 && (
                 <div className="text-center text-slate-500">No processed records yet.</div>
               )}
-              {!processedLoading && !processedError && processed.map((p) => {
-                const chips = [
-                  p.processedStatus === "approved" ? "Accepted" : "Declined",
-                  `MWK ${money(p.currentBalance ?? p.loanAmount ?? 0)}`
-                ];
-                const meta = `${p.area || "—"} · ${p.processedAt ? new Date(toMillis(p.processedAt) || 0).toLocaleString() : ""}`;
-                return (
-                  <div key={p.id} className="rounded-xl border bg-white p-3 flex items-start justify-between gap-2">
-                    <div>
-                      <div className="font-medium text-slate-900">{p.applicantFull || "—"}</div>
-                      <div className="text-xs text-slate-600 mt-0.5">{p.mobile || "—"}{p.email ? ` · ${p.email}` : ""}</div>
-                      <div className="mt-1 flex flex-wrap gap-1">
-                        {chips.map(c => <span key={c} className="inline-flex items-center rounded-full px-2 py-0.5 text-xs border bg-slate-50 text-slate-700">{c}</span>)}
+              {!processedLoading && !processedError && processed
+                .filter(p => !p.cleared)
+                .map((p) => {
+                  const chips = [
+                    p.processedStatus === "approved" ? "Accepted" : "Declined",
+                    `MWK ${money(p.currentBalance ?? p.loanAmount ?? 0)}`
+                  ];
+                  const meta = `${p.area || "—"} · ${p.processedAt ? new Date(toMillis(p.processedAt) || 0).toLocaleString() : ""}`;
+                  return (
+                    <div key={p.id} className="rounded-xl border bg-white p-3 flex items-start justify-between gap-2">
+                      <div>
+                        <div className="font-medium text-slate-900">{p.applicantFull || "—"}</div>
+                        <div className="text-xs text-slate-600 mt-0.5">{p.mobile || "—"}{p.email ? ` · ${p.email}` : ""}</div>
+                        <div className="mt-1 flex flex-wrap gap-1">
+                          {chips.map((c) => (
+                            <span key={c} className="inline-flex items-center rounded-full px-2 py-0.5 text-xs border bg-slate-50 text-slate-700">
+                              {c}
+                            </span>
+                          ))}
+                        </div>
+                        <div className="text-xs text-slate-500 mt-1">{meta}</div>
                       </div>
-                      <div className="text-xs text-slate-500 mt-1">{meta}</div>
+
+                      <div className="flex items-center gap-2">
+                        {/* CONSIDER (restore) */}
+                        <button
+                          onClick={async () => {
+                            if (!confirm("Move back to Active (loan_applications)?")) return;
+                            await considerBackToActive(p);
+                          }}
+                          className="rounded-lg bg-amber-600 text-white px-2.5 py-1.5 text-xs hover:bg-amber-700"
+                          title="Restore to active"
+                        >
+                          Consider
+                        </button>
+
+                        {/* CLEAR (hide) */}
+                        <button
+                          onClick={async () => {
+                            if (!confirm("Hide this record from Processed (not deleted)?")) return;
+                            await clearProcessed(p);
+                          }}
+                          className="rounded-lg border px-2.5 py-1.5 text-xs hover:bg-slate-50"
+                          title="Hide from list (not deleted)"
+                        >
+                          Clear
+                        </button>
+
+                        {/* DELETE FOREVER */}
+                        <button
+                          onClick={async () => {
+                            if (!confirm("Delete this processed record forever?")) return;
+                            await deleteProcessedForever(p);
+                          }}
+                          className="rounded-lg bg-rose-600 text-white px-2.5 py-1.5 text-xs hover:bg-rose-700"
+                          title="Delete forever"
+                        >
+                          Delete forever
+                        </button>
+                      </div>
                     </div>
-                    <div className="flex items-center gap-2">
-                      <button
-                        onClick={async () => {
-                          if (!confirm("Delete this processed record forever?")) return;
-                          try { await deleteDoc(fsDoc(db, "processed_loans", p.id)); }
-                          catch (e: any) { alert(`Failed to delete: ${e?.message || e}`); }
-                        }}
-                        className="rounded-lg bg-rose-600 text-white px-2.5 py-1.5 text-xs hover:bg-rose-700"
-                        title="Delete forever"
-                      >
-                        Delete forever
-                      </button>
-                    </div>
-                  </div>
-                );
-              })}
+                  );
+                })}
             </div>
           </Section>
 
@@ -717,8 +769,6 @@ export default function AdminDashboardPage() {
         {(loansError || kycError) && (
           <div className="text-center text-xs text-rose-600 pt-2">{loansError || kycError}</div>
         )}
-
-       
       </main>
 
       <LoanPreviewModal loanId={viewLoanId} onClose={() => setViewLoanId(null)} />
@@ -826,10 +876,8 @@ function LoanPreviewModal({ loanId, onClose }: { loanId: string | null; onClose:
     const busyKey = next === "approved" ? "accept" : "decline";
     setBusy(busyKey);
     try {
-      // Optional: reflect status on the original before moving.
       try { await updateDoc(fsDoc(db, "loan_applications", loanId), { status: next }); } catch {}
 
-      // Create processed doc (same id as original for easy trace)
       const processedDoc: ProcessedLoan & Record<string, any> = {
         id: loanId,
         applicantFull: data.applicantFull || "—",
@@ -844,12 +892,13 @@ function LoanPreviewModal({ loanId, onClose }: { loanId: string | null; onClose:
         frequency: data.frequency ?? "monthly",
         startMs: data.startMs ?? null,
         endMs: data.endMs ?? null,
-        original: loanRaw || {}, // keep raw snapshot for audit (optional)
+        original: loanRaw || {},
+        cleared: false,
       };
 
       await setDoc(fsDoc(db, "processed_loans", loanId), processedDoc);
-      await deleteDoc(fsDoc(db, "loan_applications", loanId)); // remove from active
-      onClose(); // close and the item shows up under Processed
+      await deleteDoc(fsDoc(db, "loan_applications", loanId));
+      onClose();
     } catch (e: any) {
       alert(`Failed to move to processed: ${e?.message || e}`);
     } finally {
@@ -1004,8 +1053,14 @@ function NotifyEmailModal({
 
             <label className="grid gap-1 text-sm">
               <span className="text-slate-700">To (email)</span>
-              <input value={toEmail} onChange={(e) => setToEmail(e.target.value)} 
-              type="email" className="rounded-lg border px-3 py-2 placeholder:text-black placeholder:opacity-100" placeholder="client@example.com" required />
+              <input
+                value={toEmail}
+                onChange={(e) => setToEmail(e.target.value)}
+                type="email"
+                className="rounded-lg border px-3 py-2 placeholder:text-black placeholder:opacity-100"
+                placeholder="client@example.com"
+                required
+              />
             </label>
 
             <label className="grid gap-1 text-sm">
@@ -1037,7 +1092,7 @@ function NotifyEmailModal({
 }
 
 /* =========================================================
-   KYC Preview Modal (unchanged)
+   KYC Preview Modal
    ========================================================= */
 function KycPreviewModal({ kycId, onClose }: { kycId: string | null; onClose: () => void; }) {
   const [data, setData] = useState<any>(null);
