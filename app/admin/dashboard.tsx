@@ -153,6 +153,13 @@ function detectKycId(loan: any): string | undefined {
 const STATUS_PALETTE: Record<string, string> = { pending:"#f59e0b", approved:"#0ea5e9", active:"#22c55e", overdue:"#ef4444", closed:"#6b7280", declined:"#ef4444", unknown:"#94a3b8" };
 const TYPE_PALETTE: Record<string, string> = { business:"#0ea5e9", payroll:"#a855f7", salary:"#6366f1", agriculture:"#22c55e", school:"#f59e0b", unknown:"#94a3b8" };
 
+/* Show base64 as data URL if needed */
+function toDataUrlMaybe(b64?: string) {
+  if (!b64 || typeof b64 !== "string") return "";
+  const s = b64.trim();
+  return s.startsWith("data:") ? s : `data:image/jpeg;base64,${s}`;
+}
+
 /* =========================================================
    Page
    ========================================================= */
@@ -669,10 +676,8 @@ export default function AdminDashboardPage() {
                       <div className="text-xs text-slate-600 mt-1">{(k.mobile || "—")}{k.email ? ` · ${k.email}` : ""}</div>
                     </div>
                     <div className="flex items-center gap-2">
-                      <Link href={`/kyc/${k.id}`} className="rounded-lg border px-2.5 py-1.5 text-xs hover:bg-slate-50">
-                          Open page
-                        </Link>
-
+                      {/* FIXED: route to /kyc/[id] */}
+                      <Link href={`/kyc/${k.id}`} className="rounded-lg border px-2.5 py-1.5 text-xs hover:bg-slate-50">Open page</Link>
                       <button onClick={() => setViewKycId(k.id)} className="rounded-lg bg-blue-600 text-white px-2.5 py-1.5 text-xs hover:bg-blue-700">View KYC</button>
                     </div>
                   </div>
@@ -1095,7 +1100,7 @@ function NotifyEmailModal({
 }
 
 /* =========================================================
-   KYC Preview Modal
+   KYC Preview Modal (with images + fixed link path)
    ========================================================= */
 function KycPreviewModal({ kycId, onClose }: { kycId: string | null; onClose: () => void; }) {
   const [data, setData] = useState<any>(null);
@@ -1144,28 +1149,106 @@ function KycPreviewModal({ kycId, onClose }: { kycId: string | null; onClose: ()
             {isLoading && <SkeletonLine count={6} />}
             {err && <div className="text-rose-600 text-sm">Failed to load KYC: {err}</div>}
             {!isLoading && !err && (
-              <div className="grid gap-2 text-sm">
-                <KV
-                  label="Name"
-                  value={[data?.title, data?.firstName ?? data?.applicantFirstName, data?.lastName ?? data?.surname ?? data?.applicantLastName].filter(Boolean).join(" ") || "—"}
-                />
-                <KV label="ID Number" value={data?.idNumber || "—"} />
-                <KV label="Gender" value={data?.gender || "—"} />
-                <KV label="Date of Birth" value={fmtMaybeDate(data?.dateOfBirth)} />
-                <KV label="Email" value={data?.email1 || data?.email || "—"} />
-                <KV label="Mobile" value={data?.mobileTel1 || data?.mobile || "—"} />
-                <KV label="Address / City" value={data?.physicalAddress || data?.physicalCity || data?.areaName || "—"} />
-                <KV label="Employer" value={data?.employer || "—"} />
-                <KV label="Dependants" value={String(data?.dependants ?? "—")} />
-                <KV label="Next of Kin" value={`${data?.familyName || "—"} (${data?.familyRelation || "—"})${data?.familyMobile ? " · " + data?.familyMobile : ""}`} />
-              </div>
+              <>
+                <div className="grid gap-2 text-sm">
+                  <KV
+                    label="Name"
+                    value={[data?.title, data?.firstName ?? data?.applicantFirstName, data?.lastName ?? data?.surname ?? data?.applicantLastName].filter(Boolean).join(" ") || "—"}
+                  />
+                  <KV label="ID Number" value={data?.idNumber || "—"} />
+                  <KV label="Gender" value={data?.gender || "—"} />
+                  <KV label="Date of Birth" value={fmtMaybeDate(data?.dateOfBirth)} />
+                  <KV label="Email" value={data?.email1 || data?.email || "—"} />
+                  <KV label="Mobile" value={data?.mobileTel1 || data?.mobile || "—"} />
+                  <KV label="Address / City" value={data?.physicalAddress || data?.physicalCity || data?.areaName || "—"} />
+                  <KV label="Employer" value={data?.employer || "—"} />
+                  <KV label="Dependants" value={String(data?.dependants ?? "—")} />
+                  <KV label="Next of Kin" value={`${data?.familyName || "—"} (${data?.familyRelation || "—"})${data?.familyMobile ? " · " + data?.familyMobile : ""}`} />
+                </div>
+
+                {(data?.idFrontImageBase64 || data?.idBackImageBase64 || data?.selfieImageBase64) && (
+                  <div className="mt-4">
+                    <div className="text-sm font-medium text-slate-800 mb-2">Identity Images</div>
+                    <div className="grid gap-3 sm:grid-cols-3">
+                      {/* ID Front */}
+                      {data?.idFrontImageBase64 ? (
+                        <div className="rounded-lg border p-2 bg-slate-50">
+                          <div className="text-xs text-slate-600 mb-1">ID Front</div>
+                          <img
+                            src={toDataUrlMaybe(data.idFrontImageBase64)}
+                            alt="ID Front"
+                            className="w-full h-36 object-cover rounded-md border bg-white"
+                          />
+                          <a
+                            href={toDataUrlMaybe(data.idFrontImageBase64)}
+                            download={`kyc-${data?.id || "doc"}-id-front.jpg`}
+                            className="mt-2 inline-flex text-xs text-blue-700 hover:underline"
+                          >
+                            Download
+                          </a>
+                        </div>
+                      ) : (
+                        <div className="rounded-lg border p-2 bg-slate-50 text-xs text-slate-500 grid place-items-center">
+                          No ID Front
+                        </div>
+                      )}
+
+                      {/* ID Back */}
+                      {data?.idBackImageBase64 ? (
+                        <div className="rounded-lg border p-2 bg-slate-50">
+                          <div className="text-xs text-slate-600 mb-1">ID Back</div>
+                          <img
+                            src={toDataUrlMaybe(data.idBackImageBase64)}
+                            alt="ID Back"
+                            className="w-full h-36 object-cover rounded-md border bg-white"
+                          />
+                          <a
+                            href={toDataUrlMaybe(data.idBackImageBase64)}
+                            download={`kyc-${data?.id || "doc"}-id-back.jpg`}
+                            className="mt-2 inline-flex text-xs text-blue-700 hover:underline"
+                          >
+                            Download
+                          </a>
+                        </div>
+                      ) : (
+                        <div className="rounded-lg border p-2 bg-slate-50 text-xs text-slate-500 grid place-items-center">
+                          No ID Back
+                        </div>
+                      )}
+
+                      {/* Selfie */}
+                      {data?.selfieImageBase64 ? (
+                        <div className="rounded-lg border p-2 bg-slate-50">
+                          <div className="text-xs text-slate-600 mb-1">Selfie</div>
+                          <img
+                            src={toDataUrlMaybe(data.selfieImageBase64)}
+                            alt="Selfie"
+                            className="w-full h-36 object-cover rounded-md border bg-white"
+                          />
+                          <a
+                            href={toDataUrlMaybe(data.selfieImageBase64)}
+                            download={`kyc-${data?.id || "doc"}-selfie.jpg`}
+                            className="mt-2 inline-flex text-xs text-blue-700 hover:underline"
+                          >
+                            Download
+                          </a>
+                        </div>
+                      ) : (
+                        <div className="rounded-lg border p-2 bg-slate-50 text-xs text-slate-500 grid place-items-center">
+                          No Selfie
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </>
             )}
           </div>
           <div className="p-4 border-t text-right">
+            {/* FIXED: route to /kyc/[id] */}
             <Link href={`/kyc/${kycId}`} className="inline-flex items-center rounded-lg bg-blue-600 text-white px-3 py-1.5 text-sm hover:bg-blue-700">
-                Open Full KYC
-              </Link>
-
+              Open Full KYC
+            </Link>
           </div>
         </div>
       </div>
