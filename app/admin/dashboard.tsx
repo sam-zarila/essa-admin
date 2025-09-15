@@ -669,7 +669,10 @@ export default function AdminDashboardPage() {
                       <div className="text-xs text-slate-600 mt-1">{(k.mobile || "—")}{k.email ? ` · ${k.email}` : ""}</div>
                     </div>
                     <div className="flex items-center gap-2">
-                      <Link href={`/admin/kyc/${k.id}`} className="rounded-lg border px-2.5 py-1.5 text-xs hover:bg-slate-50">Open page</Link>
+                      <Link href={`/kyc/${k.id}`} className="rounded-lg border px-2.5 py-1.5 text-xs hover:bg-slate-50">
+                          Open page
+                        </Link>
+
                       <button onClick={() => setViewKycId(k.id)} className="rounded-lg bg-blue-600 text-white px-2.5 py-1.5 text-xs hover:bg-blue-700">View KYC</button>
                     </div>
                   </div>
@@ -1159,9 +1162,10 @@ function KycPreviewModal({ kycId, onClose }: { kycId: string | null; onClose: ()
             )}
           </div>
           <div className="p-4 border-t text-right">
-            <Link href={`/admin/kyc/${kycId}`} className="inline-flex items-center rounded-lg bg-blue-600 text-white px-3 py-1.5 text-sm hover:bg-blue-700">
-              Open Full KYC
-            </Link>
+            <Link href={`/kyc/${kycId}`} className="inline-flex items-center rounded-lg bg-blue-600 text-white px-3 py-1.5 text-sm hover:bg-blue-700">
+                Open Full KYC
+              </Link>
+
           </div>
         </div>
       </div>
