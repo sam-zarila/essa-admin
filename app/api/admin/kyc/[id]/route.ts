@@ -1,17 +1,19 @@
-export const runtime = "nodejs";
-import { requireAdmin } from "@/app/lib/auth-server";
+import { NextRequest, NextResponse } from "next/server";
 import { adminDb } from "@/app/lib/firebase-admin";
-import { NextResponse } from "next/server";
 
+export const runtime = "nodejs";
 
-type Params = { params: { id: string } };
+export async function GET(
+  _req: NextRequest,
+  { params }: { params: { id: string } }
+) {
+  const db = adminDb();
+  const doc = await db.collection("kyc_data").doc(params.id).get();
 
-export async function GET(_req: Request, { params }: Params) {
-  const gate = await requireAdmin();
-  if (!gate.ok) return NextResponse.json({ error: gate.error }, { status: gate.status });
-
-  const doc = await adminDb.collection("kyc_data").doc(params.id).get();
-  if (!doc.exists) return NextResponse.json({ error: "Not found" }, { status: 404 });
+  if (!doc.exists) {
+    return NextResponse.json({ error: "Not found" }, { status: 404 });
+  }
 
   return NextResponse.json({ id: doc.id, ...doc.data() });
 }
+

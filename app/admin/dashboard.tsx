@@ -26,9 +26,8 @@ const EMAILJS_SERVICE_ID = process.env.NEXT_PUBLIC_EMAILJS_SERVICE_ID || "YOUR_S
 const EMAILJS_TEMPLATE_ID = process.env.NEXT_PUBLIC_EMAILJS_TEMPLATE_ID || "YOUR_TEMPLATE_ID";
 const EMAILJS_PUBLIC_KEY  = process.env.NEXT_PUBLIC_EMAILJS_PUBLIC_KEY  || "YOUR_PUBLIC_KEY";
 
-/* ==== Config: Late fee calculation (change to your policy) ==== */
-// Late fee = currentBalance * LATE_FEE_DAILY_RATE * overdueDays
-const LATE_FEE_DAILY_RATE = 0.005; // 0.5% per day
+/* Late-fee config (per-day rate; tune via env if needed) */
+const LATE_FEE_DAILY = Number(process.env.NEXT_PUBLIC_LATE_FEE_DAILY || 0.001); // 0.1%/day default
 
 /* =========================================================
    Types
@@ -48,10 +47,9 @@ type Loan = {
   currentBalance?: number;
   endDate?: string | number | Date | null;
   status?: "pending" | "approved" | "active" | "overdue" | "closed" | "declined" | string;
-  collateralItems?: unknown[];
+  collateralItems?: any[];
   loanType?: string;
   timestamp?: Timestamp | FireTimestamp | number | string | Date | null;
-  /** mapped for convenience */
   kycId?: string;
 };
 
@@ -98,7 +96,6 @@ type KycRow = {
   physicalCity?: string;
 };
 
-/* Collateral view model */
 type CollateralVM = {
   key: string;
   label: string;
@@ -109,11 +106,12 @@ type CollateralVM = {
   area?: string;
   startMs: number | null;
   endMs: number | null;
-  daysLeft: number | null;     // positive = days remaining, negative = overdue days * -1
-  overdueDays: number;         // >= 0
-  lateFee: number;             // >= 0
+  daysLeft: number | null;
+  overdueDays: number;
+  lateFee: number;
   currentBalance: number;
   kycId?: string;
+  imageUrl?: string | null;
 };
 
 /* =========================================================
@@ -176,52 +174,75 @@ function detectKycId(loan: any): string | undefined {
 const STATUS_PALETTE: Record<string, string> = { pending:"#f59e0b", approved:"#0ea5e9", active:"#22c55e", overdue:"#ef4444", closed:"#6b7280", declined:"#ef4444", unknown:"#94a3b8" };
 const TYPE_PALETTE: Record<string, string> = { business:"#0ea5e9", payroll:"#a855f7", salary:"#6366f1", agriculture:"#22c55e", school:"#f59e0b", unknown:"#94a3b8" };
 
-/* Show base64 as data URL if needed */
+/* Base64/URL helpers for images */
 function toDataUrlMaybe(b64?: string) {
   if (!b64 || typeof b64 !== "string") return "";
   const s = b64.trim();
   return s.startsWith("data:") ? s : `data:image/jpeg;base64,${s}`;
 }
+function isUrlLike(s?: string) {
+  if (!s || typeof s !== "string") return false;
+  const t = s.trim();
+  return t.startsWith("http://") || t.startsWith("https://") || t.startsWith("data:");
+}
+/* Try to extract an image URL or data URI from a collateral item */
+function collateralImageUrl(it: any): string | null {
+  if (!it) return null;
+  if (typeof it === "string") return isUrlLike(it) ? it : null;
+  if (typeof it === "object") {
+    const cand =
+      it.imageUrl || it.photoUrl || it.pictureUrl || it.thumbnail || it.thumbUrl ||
+      it.url || it.image || it.photo || it.picture;
+    if (typeof cand === "string" && isUrlLike(cand)) return cand;
 
-/* Collateral helpers */
+    const b64 = it.imageBase64 || it.photoBase64 || it.pictureBase64 || it.thumbnailBase64;
+    if (typeof b64 === "string" && b64.trim()) return toDataUrlMaybe(b64);
+
+    const arrCand =
+      (Array.isArray(it.images) && it.images[0]) ||
+      (Array.isArray(it.photos) && it.photos[0]) ||
+      (Array.isArray(it.pictures) && it.pictures[0]);
+    if (typeof arrCand === "string" && isUrlLike(arrCand)) return arrCand;
+    if (arrCand && typeof arrCand === "object") {
+      const nestedUrl = arrCand.url || arrCand.imageUrl || arrCand.photoUrl || arrCand.src;
+      if (typeof nestedUrl === "string" && isUrlLike(nestedUrl)) return nestedUrl;
+      const nestedB64 = arrCand.base64 || arrCand.imageBase64;
+      if (typeof nestedB64 === "string" && nestedB64.trim()) return toDataUrlMaybe(nestedB64);
+    }
+  }
+  return null;
+}
 function collateralLabel(it: any): string {
+  if (!it) return "Collateral item";
   if (typeof it === "string") return it;
-  if (!it || typeof it !== "object") return "Item";
-  return it.label || it.name || it.type || it.kind || it.description || JSON.stringify(it);
+  if (typeof it === "object") {
+    return (
+      it.label || it.name || it.title || it.model || it.description ||
+      `${it.make ? it.make + " " : ""}${it.model ? it.model : "Item"}`
+    );
+  }
+  return "Collateral item";
 }
-function collateralValue(it: any): number | null {
-  if (!it || typeof it !== "object") return null;
-  const v = it.value ?? it.estimatedValue ?? it.estimate ?? it.price ?? null;
-  const n = typeof v === "string" ? Number(v.replace(/[^\d.]/g, "")) : v;
-  return typeof n === "number" && isFinite(n) ? n : null;
-}
-function daysBetween(aMs: number, bMs: number) {
-  const d = Math.floor((bMs - aMs) / (24*60*60*1000));
-  return d;
-}
-function diffDaysCeil(aMs: number, bMs: number) {
-  // days from now (aMs) to date (bMs), rounded up magnitude
-  const raw = (bMs - aMs) / (24*60*60*1000);
-  return raw >= 0 ? Math.ceil(raw) : -Math.ceil(-raw);
+function collateralValue(it: any): number | undefined {
+  if (!it || typeof it !== "object") return undefined;
+  const v = it.value || it.estimatedValue || it.estValue || it.amount || it.price;
+  return typeof v === "number" ? v : undefined;
 }
 
 /* =========================================================
    Page
    ========================================================= */
 export default function AdminDashboardPage() {
-  /* --- Global feedback (toast) --- */
-  type Feedback = { kind: "success" | "error" | "info"; message: string } | null;
-  const [feedback, setFeedback] = useState<Feedback>(null);
-  function notify(kind: "success" | "error" | "info", message: string) {
-    setFeedback({ kind, message });
-    window.clearTimeout((notify as any)._t);
-    (notify as any)._t = window.setTimeout(() => setFeedback(null), 4000);
+  /* Feedback banner */
+  const [feedback, setFeedback] = useState<{ type: "success" | "error" | "info"; text: string } | null>(null);
+  function pushFeedback(type: "success" | "error" | "info", text: string) {
+    setFeedback({ type, text });
+    window.setTimeout(() => setFeedback(null), 4000);
   }
 
   /* Loans (active) */
   const [loansRaw, setLoansRaw] = useState<Loan[]>([]);
   const [loansLoading, setLoansLoading] = useState(true);
-
   const [loansError, setLoansError] = useState<string | null>(null);
   const [updatedAt, setUpdatedAt] = useState<number | null>(null);
 
@@ -311,7 +332,7 @@ export default function AdminDashboardPage() {
     return () => unsub();
   }, []);
 
-  /* KYC (PERMISSIVE: no orderBy so you'll always see docs) */
+  /* KYC (permissive; always fetch something) */
   const [kycPending, setKycPending] = useState<KycRow[]>([]);
   const [kycLoading, setKycLoading] = useState(true);
   const [kycError, setKycError] = useState<string | null>(null);
@@ -495,22 +516,25 @@ export default function AdminDashboardPage() {
     return { status, type, frequency };
   }, [loans]);
 
-  /* Collateral flat list (ALL items, mapped to borrower + countdown + late fee) */
+  /* Collateral aggregation */
   const collaterals: CollateralVM[] = useMemo(() => {
-    const nowMs = Date.now();
     const list: CollateralVM[] = [];
+    const msDay = 24 * 60 * 60 * 1000;
+    const nowMs = Date.now();
+
     for (const loan of loans) {
       const items = Array.isArray(loan.collateralItems) ? loan.collateralItems : [];
+      const borrower = fullName(loan);
       const startMs = toMillis(loan.timestamp);
       const endMs = toMillis(loan.endDate);
-      const borrower = fullName({ title: loan.title, firstName: loan.firstName, surname: loan.surname });
-      for (let i = 0; i < items.length; i++) {
-        const it = items[i];
+      const daysLeft = endMs ? Math.ceil((endMs - nowMs) / msDay) : null;
+      const overdueDays = endMs && endMs < nowMs ? Math.ceil((nowMs - endMs) / msDay) : 0;
+      const lateFee = overdueDays > 0 ? (loan.currentBalance || 0) * LATE_FEE_DAILY * overdueDays : 0;
+
+      items.forEach((it, i) => {
         const label = collateralLabel(it);
         const estValue = collateralValue(it);
-        const daysLeft = endMs ? diffDaysCeil(nowMs, endMs) : null;
-        const overdueDays = daysLeft !== null && daysLeft < 0 ? -daysLeft : 0;
-        const lateFee = overdueDays > 0 ? Math.max(0, (loan.currentBalance || 0) * LATE_FEE_DAILY_RATE * overdueDays) : 0;
+        const imageUrl = collateralImageUrl(it);
         list.push({
           key: `${loan.id}#${i}`,
           label,
@@ -526,17 +550,13 @@ export default function AdminDashboardPage() {
           lateFee,
           currentBalance: loan.currentBalance || 0,
           kycId: loan.kycId,
+          imageUrl,
         });
-      }
+      });
     }
-    // Sort: overdue (most overdue first), then closest deadlines
-    list.sort((a, b) => {
-      if (a.overdueDays !== b.overdueDays) return b.overdueDays - a.overdueDays;
-      const aDays = a.daysLeft ?? 9e9;
-      const bDays = b.daysLeft ?? 9e9;
-      return aDays - bDays;
-    });
-    return list;
+
+    // Newest loans first
+    return list.sort((a, b) => (b.startMs ?? 0) - (a.startMs ?? 0));
   }, [loans]);
 
   /* KYC badge */
@@ -554,12 +574,12 @@ export default function AdminDashboardPage() {
   const [viewKycId, setViewKycId] = useState<string | null>(null);
   const [viewLoanId, setViewLoanId] = useState<string | null>(null);
 
-  /* Actions for PROCESSED list — toasts (no alerts) */
+  /* Actions for PROCESSED list */
   async function considerBackToActive(p: ProcessedLoan) {
     const original = (p as any)?.original;
     let payload: any;
     if (original && typeof original === "object" && Object.keys(original).length) {
-      payload = original;
+      payload = original; // exact original doc
     } else {
       const nameParts = (p.applicantFull || "").trim().split(/\s+/);
       payload = {
@@ -583,27 +603,27 @@ export default function AdminDashboardPage() {
     try {
       await setDoc(fsDoc(db, "loan_applications", p.id), payload, { merge: false });
       await deleteDoc(fsDoc(db, "processed_loans", p.id));
-      notify("success", "Record restored to Active.");
+      pushFeedback("success", "Moved back to Active successfully.");
     } catch (e: any) {
-      notify("error", `Failed to restore: ${e?.message || e}`);
+      pushFeedback("error", `Failed to restore: ${e?.message || e}`);
     }
   }
 
   async function clearProcessed(p: ProcessedLoan) {
     try {
       await updateDoc(fsDoc(db, "processed_loans", p.id), { cleared: true, clearedAt: Date.now() });
-      notify("success", "Record hidden from Processed.");
+      pushFeedback("success", "Record hidden from Processed.");
     } catch (e: any) {
-      notify("error", `Failed to clear: ${e?.message || e}`);
+      pushFeedback("error", `Failed to clear: ${e?.message || e}`);
     }
   }
 
   async function deleteProcessedForever(p: ProcessedLoan) {
     try {
       await deleteDoc(fsDoc(db, "processed_loans", p.id));
-      notify("success", "Processed record deleted.");
+      pushFeedback("success", "Record deleted permanently.");
     } catch (e: any) {
-      notify("error", `Failed to delete: ${e?.message || e}`);
+      pushFeedback("error", `Failed to delete: ${e?.message || e}`);
     }
   }
 
@@ -618,9 +638,6 @@ export default function AdminDashboardPage() {
 
   return (
     <div className="min-h-screen w-full bg-slate-50">
-      {/* Toast */}
-      <Toast feedback={feedback} onClose={() => setFeedback(null)} />
-
       {/* Header */}
       <header className="sticky top-0 z-20 border-b bg-white/90 backdrop-blur supports-[backdrop-filter]:bg-white/60">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 h-16 flex items-center justify-between">
@@ -640,6 +657,22 @@ export default function AdminDashboardPage() {
         </div>
       </header>
 
+      {/* Feedback banner */}
+      {feedback && (
+        <div className={`mx-auto max-w-7xl px-4 sm:px-6 pt-3`}>
+          <div
+            className={[
+              "rounded-md border px-3 py-2 text-sm",
+              feedback.type === "success" ? "bg-emerald-50 border-emerald-200 text-emerald-800" :
+              feedback.type === "error" ? "bg-rose-50 border-rose-200 text-rose-800" :
+              "bg-slate-50 border-slate-200 text-slate-800",
+            ].join(" ")}
+          >
+            {feedback.text}
+          </div>
+        </div>
+      )}
+
       <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-8">
         {/* KPIs */}
         <section>
@@ -648,19 +681,12 @@ export default function AdminDashboardPage() {
           </div>
         </section>
 
-        {/* ==================== Collateral Items (ALL) ==================== */}
-        <Section
-          title={
-            <div className="flex items-center gap-2">
-              <span>Collateral Items</span>
-              <span className="text-xs text-slate-500">({num(collaterals.length)} total)</span>
-            </div>
-          }
-        >
+        {/* NEW: Collateral Items (top) */}
+        <Section title="Collateral items">
           <ResponsiveTable
             isLoading={loansLoading}
             emptyText="No collateral items found."
-            headers={["Item", "Borrower", "Balance", "Dates", "Countdown", "Late Fee", ""]}
+            headers={["Image", "Item", "Borrower", "Balance", "Dates", "Countdown", "Late Fee", ""]}
             rows={collaterals.slice(0, 25).map((c) => {
               const countdown =
                 c.daysLeft === null ? "—" :
@@ -674,17 +700,39 @@ export default function AdminDashboardPage() {
                 "bg-rose-50 text-rose-700 border-rose-200";
 
               return [
+                /* IMAGE */
+                <div key="img" className="flex items-center">
+                  {c.imageUrl ? (
+                    <img
+                      src={c.imageUrl}
+                      alt={c.label}
+                      className="h-14 w-14 object-cover rounded-md border bg-white"
+                      loading="lazy"
+                    />
+                  ) : (
+                    <div className="h-14 w-14 rounded-md border bg-slate-100 grid place-items-center text-[10px] text-slate-500 px-1 text-center">
+                      No image
+                    </div>
+                  )}
+                </div>,
+
+                /* ITEM */
                 <div key="a">
                   <div className="font-medium text-slate-900">{c.label}</div>
-                  {typeof c.estValue === "number" && <div className="text-xs text-slate-500">Est. value: MWK {money(c.estValue)}</div>}
+                  {typeof c.estValue === "number" && (
+                    <div className="text-xs text-slate-500">Est. value: MWK {money(c.estValue)}</div>
+                  )}
                 </div>,
+
                 <CellPrimary key="b" title={c.borrower || "—"} subtitle={c.mobile || c.area || "—"} />,
                 <span key="c" className="font-medium text-slate-900">MWK {money(c.currentBalance)}</span>,
                 <span key="d" className="text-slate-700">
                   {fmtDate(c.startMs)} → {fmtDate(c.endMs)}
                 </span>,
                 <span key="e" className={`inline-flex items-center rounded-full border px-2 py-0.5 text-xs ${chipClass}`}>{countdown}</span>,
-                <span key="f" className="font-medium text-slate-900">{c.overdueDays > 0 ? `MWK ${money(Math.ceil(c.lateFee))}` : "—"}</span>,
+                <span key="f" className="font-medium text-slate-900">
+                  {c.overdueDays > 0 ? `MWK ${money(Math.ceil(c.lateFee))}` : "—"}
+                </span>,
                 <div key="g" className="flex items-center gap-2">
                   <button onClick={() => setViewLoanId(c.loanId)} className="rounded-lg border px-2.5 py-1.5 text-xs hover:bg-slate-50">
                     View loan
@@ -702,17 +750,10 @@ export default function AdminDashboardPage() {
               ];
             })}
           />
-          {collaterals.length > 25 && (
-            <div className="mt-2 text-xs text-slate-500">Showing 25 of {num(collaterals.length)}. Narrow your query if needed.</div>
-          )}
         </Section>
 
         {/* Loan Detailed Overview */}
-        <section className="rounded-2xl border bg-white p-4 sm:p-6">
-          <div className="flex items-center justify-between">
-            <h2 className="text-base sm:text-lg font-semibold text-slate-900">Loan Detailed Overview</h2>
-          </div>
-
+        <Section className="rounded-2xl border bg-white p-4 sm:p-6" title={<div className="text-base sm:text-lg font-semibold text-slate-900">Loan Detailed Overview</div>}>
           <div className="mt-4 grid gap-4 lg:grid-cols-3">
             <div className="rounded-xl border p-4">
               <h3 className="font-medium text-slate-800">By Status</h3>
@@ -748,7 +789,7 @@ export default function AdminDashboardPage() {
               </div>
             </div>
           </div>
-        </section>
+        </Section>
 
         {/* Main content */}
         <div className="grid gap-4 xl:grid-cols-2">
@@ -787,23 +828,12 @@ export default function AdminDashboardPage() {
             <ListCards
               isLoading={loansLoading}
               emptyText="No overdue loans with collateral."
-              items={overdueWithCollateral.map((r) => {
-                const nowMs = Date.now();
-                const endMs = toMillis(r.endDate) || 0;
-                const overdueDays = endMs ? Math.max(0, -diffDaysCeil(nowMs, endMs)) : 0;
-                const lateFee = overdueDays > 0 ? Math.max(0, (r.currentBalance || 0) * LATE_FEE_DAILY_RATE * overdueDays) : 0;
-                return {
-                  title: fullName(r),
-                  chips: [
-                    `MWK ${money(r.currentBalance || 0)}`,
-                    `${r.collateralItems?.length || 0} item(s)`,
-                    `Overdue ${overdueDays}d`,
-                    `Late Fee MWK ${money(Math.ceil(lateFee))}`,
-                  ],
-                  meta: `Since ${fmtDate(r.endDate as any)} · ${r.areaName || "—"}`,
-                  onClick: () => setViewLoanId(r.id),
-                };
-              })}
+              items={overdueWithCollateral.map((r) => ({
+                title: fullName(r),
+                chips: [`MWK ${money(r.currentBalance || 0)}`, `${r.collateralItems?.length || 0} item(s)`],
+                meta: `Overdue since ${fmtDate(r.endDate as any)} · ${r.areaName || "—"}`,
+                onClick: () => setViewLoanId(r.id),
+              }))}
             />
           </Section>
 
@@ -948,7 +978,7 @@ export default function AdminDashboardPage() {
         )}
       </main>
 
-      <LoanPreviewModal loanId={viewLoanId} onClose={() => setViewLoanId(null)} onFeedback={notify} />
+      <LoanPreviewModal loanId={viewLoanId} onClose={() => setViewLoanId(null)} onFeedback={pushFeedback} />
     </div>
   );
 }
@@ -963,7 +993,7 @@ function LoanPreviewModal({
 }: {
   loanId: string | null;
   onClose: () => void;
-  onFeedback?: (kind: "success" | "error" | "info", message: string) => void;
+  onFeedback: (type: "success" | "error" | "info", text: string) => void;
 }) {
   const [data, setData] = useState<any>(null);
   const [loanRaw, setLoanRaw] = useState<any>(null);
@@ -1062,6 +1092,7 @@ function LoanPreviewModal({
     setBusy(busyKey);
     try {
       try { await updateDoc(fsDoc(db, "loan_applications", loanId), { status: next }); } catch {}
+
       const processedDoc: ProcessedLoan & Record<string, any> = {
         id: loanId,
         applicantFull: data.applicantFull || "—",
@@ -1082,10 +1113,10 @@ function LoanPreviewModal({
 
       await setDoc(fsDoc(db, "processed_loans", loanId), processedDoc);
       await deleteDoc(fsDoc(db, "loan_applications", loanId));
-      onFeedback?.("success", next === "approved" ? "Application approved." : "Application declined.");
+      onFeedback("success", `Loan ${next === "approved" ? "approved" : "declined"} and moved to Processed.`);
       onClose();
     } catch (e: any) {
-      onFeedback?.("error", `Failed to move to Processed: ${e?.message || e}`);
+      onFeedback("error", `Failed to move to processed: ${e?.message || e}`);
     } finally {
       setBusy(null);
     }
@@ -1103,7 +1134,7 @@ function LoanPreviewModal({
 
           <div className="p-4">
             {loading && <SkeletonLine count={6} />}
-            {err && <div className="text-rose-600 text-sm">Failed to load: {err}</div>}
+            {err && <div className="rounded-md bg-rose-50 border border-rose-200 text-rose-800 text-sm px-3 py-2">Failed to load: {err}</div>}
             {!loading && !err && data && (
               <div className="grid gap-3 text-sm">
                 <KV label="Applicant" value={data.applicantFull || "—"} />
@@ -1122,10 +1153,12 @@ function LoanPreviewModal({
                     <div className="text-slate-500 mb-1">Collateral</div>
                     <div className="flex flex-wrap gap-2">
                       {data.collateralItems.map((it: any, i: number) => {
-                        const label = typeof it === "string" ? it : JSON.stringify(it);
+                        const label = collateralLabel(it);
                         const color = pickColor(label);
+                        const thumb = collateralImageUrl(it);
                         return (
-                          <span key={i} className="inline-flex items-center rounded-full px-2.5 py-1 text-xs font-medium border" style={{ borderColor: color, color }} title={label}>
+                          <span key={i} className="inline-flex items-center gap-2 rounded-full px-2.5 py-1 text-xs font-medium border" style={{ borderColor: color, color }}>
+                            {thumb ? <img src={thumb} alt="" className="h-5 w-5 rounded object-cover" /> : null}
                             {label}
                           </span>
                         );
@@ -1277,7 +1310,7 @@ function NotifyEmailModal({
 }
 
 /* =========================================================
-   KYC Preview Modal (includes images)
+   KYC Preview Modal (includes ID/selfie images)
    ========================================================= */
 function KycPreviewModal({ kycId, onClose }: { kycId: string | null; onClose: () => void; }) {
   const [data, setData] = useState<any>(null);
@@ -1313,6 +1346,10 @@ function KycPreviewModal({ kycId, onClose }: { kycId: string | null; onClose: ()
 
   if (!kycId) return null;
 
+  const idFront = toDataUrlMaybe(data?.idFrontImageBase64);
+  const idBack = toDataUrlMaybe(data?.idBackImageBase64);
+  const selfie = toDataUrlMaybe(data?.selfieImageBase64);
+
   return (
     <div className="fixed inset-0 z-40">
       <div className="absolute inset-0 bg-black/40" onClick={onClose} />
@@ -1324,56 +1361,40 @@ function KycPreviewModal({ kycId, onClose }: { kycId: string | null; onClose: ()
           </div>
           <div className="p-4">
             {isLoading && <SkeletonLine count={6} />}
-            {err && <div className="text-rose-600 text-sm">Failed to load KYC: {err}</div>}
+            {err && <div className="rounded-md bg-rose-50 border border-rose-200 text-rose-800 text-sm px-3 py-2">Failed to load KYC: {err}</div>}
             {!isLoading && !err && (
-              <>
-                <div className="grid gap-2 text-sm">
-                  <KV
-                    label="Name"
-                    value={[data?.title, data?.firstName ?? data?.applicantFirstName, data?.lastName ?? data?.surname ?? data?.applicantLastName].filter(Boolean).join(" ") || "—"}
-                  />
-                  <KV label="ID Number" value={data?.idNumber || "—"} />
-                  <KV label="Gender" value={data?.gender || "—"} />
-                  <KV label="Date of Birth" value={fmtMaybeDate(data?.dateOfBirth)} />
-                  <KV label="Email" value={data?.email1 || data?.email || "—"} />
-                  <KV label="Mobile" value={data?.mobileTel1 || data?.mobile || "—"} />
-                  <KV label="Address / City" value={data?.physicalAddress || data?.physicalCity || data?.areaName || "—"} />
-                  <KV label="Employer" value={data?.employer || "—"} />
-                  <KV label="Dependants" value={String(data?.dependants ?? "—")} />
-                  <KV label="Next of Kin" value={`${data?.familyName || "—"} (${data?.familyRelation || "—"})${data?.familyMobile ? " · " + data?.familyMobile : ""}`} />
-                </div>
+              <div className="grid gap-3 text-sm">
+                <KV
+                  label="Name"
+                  value={[data?.title, data?.firstName ?? data?.applicantFirstName, data?.lastName ?? data?.surname ?? data?.applicantLastName].filter(Boolean).join(" ") || "—"}
+                />
+                <KV label="ID Number" value={data?.idNumber || "—"} />
+                <KV label="Gender" value={data?.gender || "—"} />
+                <KV label="Date of Birth" value={fmtMaybeDate(data?.dateOfBirth)} />
+                <KV label="Email" value={data?.email1 || data?.email || "—"} />
+                <KV label="Mobile" value={data?.mobileTel1 || data?.mobile || "—"} />
+                <KV label="Address / City" value={data?.physicalAddress || data?.physicalCity || data?.areaName || "—"} />
+                <KV label="Employer" value={data?.employer || "—"} />
+                <KV label="Dependants" value={String(data?.dependants ?? "—")} />
+                <KV label="Next of Kin" value={`${data?.familyName || "—"} (${data?.familyRelation || "—"})${data?.familyMobile ? " · " + data?.familyMobile : ""}`} />
 
-                {(data?.idFrontImageBase64 || data?.idBackImageBase64 || data?.selfieImageBase64) && (
-                  <div className="mt-4">
-                    <div className="text-sm font-medium text-slate-800 mb-2">Identity Images</div>
-                    <div className="grid gap-3 sm:grid-cols-3">
-                      {data?.idFrontImageBase64 ? (
-                        <div className="rounded-lg border p-2 bg-slate-50">
-                          <div className="text-xs text-slate-600 mb-1">ID Front</div>
-                          <img src={toDataUrlMaybe(data.idFrontImageBase64)} alt="ID Front" className="w-full h-36 object-cover rounded-md border bg-white" />
-                          <a href={toDataUrlMaybe(data.idFrontImageBase64)} download={`kyc-${data?.id || "doc"}-id-front.jpg`} className="mt-2 inline-flex text-xs text-blue-700 hover:underline">Download</a>
-                        </div>
-                      ) : <div className="rounded-lg border p-2 bg-slate-50 text-xs text-slate-500 grid place-items-center">No ID Front</div>}
-
-                      {data?.idBackImageBase64 ? (
-                        <div className="rounded-lg border p-2 bg-slate-50">
-                          <div className="text-xs text-slate-600 mb-1">ID Back</div>
-                          <img src={toDataUrlMaybe(data.idBackImageBase64)} alt="ID Back" className="w-full h-36 object-cover rounded-md border bg-white" />
-                          <a href={toDataUrlMaybe(data.idBackImageBase64)} download={`kyc-${data?.id || "doc"}-id-back.jpg`} className="mt-2 inline-flex text-xs text-blue-700 hover:underline">Download</a>
-                        </div>
-                      ) : <div className="rounded-lg border p-2 bg-slate-50 text-xs text-slate-500 grid place-items-center">No ID Back</div>}
-
-                      {data?.selfieImageBase64 ? (
-                        <div className="rounded-lg border p-2 bg-slate-50">
-                          <div className="text-xs text-slate-600 mb-1">Selfie</div>
-                          <img src={toDataUrlMaybe(data.selfieImageBase64)} alt="Selfie" className="w-full h-36 object-cover rounded-md border bg-white" />
-                          <a href={toDataUrlMaybe(data.selfieImageBase64)} download={`kyc-${data?.id || "doc"}-selfie.jpg`} className="mt-2 inline-flex text-xs text-blue-700 hover:underline">Download</a>
-                        </div>
-                      ) : <div className="rounded-lg border p-2 bg-slate-50 text-xs text-slate-500 grid place-items-center">No Selfie</div>}
+                {(idFront || idBack || selfie) && (
+                  <div className="mt-2">
+                    <div className="text-slate-500 mb-1">Identity Images</div>
+                    <div className="grid grid-cols-3 gap-2">
+                      <div className="rounded-md border bg-slate-50 overflow-hidden min-h-[80px] grid place-items-center">
+                        {idFront ? <img src={idFront} alt="ID Front" className="w-full h-full object-cover" /> : <span className="text-xs text-slate-500 p-2">ID Front not available</span>}
+                      </div>
+                      <div className="rounded-md border bg-slate-50 overflow-hidden min-h-[80px] grid place-items-center">
+                        {idBack ? <img src={idBack} alt="ID Back" className="w-full h-full object-cover" /> : <span className="text-xs text-slate-500 p-2">ID Back not available</span>}
+                      </div>
+                      <div className="rounded-md border bg-slate-50 overflow-hidden min-h-[80px] grid place-items-center">
+                        {selfie ? <img src={selfie} alt="Selfie" className="w-full h-full object-cover" /> : <span className="text-xs text-slate-500 p-2">Selfie not available</span>}
+                      </div>
                     </div>
                   </div>
                 )}
-              </>
+              </div>
             )}
           </div>
           <div className="p-4 border-t text-right">
@@ -1413,9 +1434,9 @@ function KPICard({
   );
 }
 
-function Section({ title, extra, children }: { title: React.ReactNode; extra?: React.ReactNode; children: React.ReactNode; }) {
+function Section({ title, extra, children, className }: { title: React.ReactNode; extra?: React.ReactNode; children: React.ReactNode; className?: string; }) {
   return (
-    <section className="rounded-2xl border bg-white p-4 sm:p-5">
+    <section className={`rounded-2xl border bg-white p-4 sm:p-5 ${className || ""}`}>
       <div className="flex items-center justify-between">
         <h2 className="text-base font-semibold text-slate-900">{title}</h2>
         {extra}
@@ -1578,25 +1599,6 @@ function KV({ label, value }: { label: string; value: React.ReactNode }) {
     <div className="flex items-start gap-3">
       <div className="w-40 shrink-0 text-slate-500">{label}</div>
       <div className="text-slate-900">{value}</div>
-    </div>
-  );
-}
-
-/* ===== Toast ===== */
-function Toast({ feedback, onClose }: { feedback: { kind: "success" | "error" | "info"; message: string } | null; onClose: () => void; }) {
-  if (!feedback) return null;
-  const tint =
-    feedback.kind === "success" ? "bg-emerald-50 border-emerald-200 text-emerald-900" :
-    feedback.kind === "error"   ? "bg-rose-50 border-rose-200 text-rose-900" :
-                                  "bg-blue-50 border-blue-200 text-blue-900";
-  return (
-    <div className="fixed top-3 right-3 z-50 max-w-sm">
-      <div className={`rounded-lg border px-3 py-2 shadow ${tint}`}>
-        <div className="flex items-start gap-3">
-          <div className="text-sm leading-5">{feedback.message}</div>
-          <button onClick={onClose} className="text-xs opacity-60 hover:opacity-100">✕</button>
-        </div>
-      </div>
     </div>
   );
 }
