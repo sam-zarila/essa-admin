@@ -26,6 +26,10 @@ const EMAILJS_SERVICE_ID = process.env.NEXT_PUBLIC_EMAILJS_SERVICE_ID || "YOUR_S
 const EMAILJS_TEMPLATE_ID = process.env.NEXT_PUBLIC_EMAILJS_TEMPLATE_ID || "YOUR_TEMPLATE_ID";
 const EMAILJS_PUBLIC_KEY  = process.env.NEXT_PUBLIC_EMAILJS_PUBLIC_KEY  || "YOUR_PUBLIC_KEY";
 
+/* ==== Config: Late fee calculation (change to your policy) ==== */
+// Late fee = currentBalance * LATE_FEE_DAILY_RATE * overdueDays
+const LATE_FEE_DAILY_RATE = 0.005; // 0.5% per day
+
 /* =========================================================
    Types
    ========================================================= */
@@ -47,6 +51,8 @@ type Loan = {
   collateralItems?: unknown[];
   loanType?: string;
   timestamp?: Timestamp | FireTimestamp | number | string | Date | null;
+  /** mapped for convenience */
+  kycId?: string;
 };
 
 type ProcessedLoan = {
@@ -63,7 +69,6 @@ type ProcessedLoan = {
   frequency?: "weekly" | "monthly" | string;
   startMs?: number | null;
   endMs?: number | null;
-  /** NEW: used for restore + hide */
   original?: any;
   cleared?: boolean;
 };
@@ -91,6 +96,24 @@ type KycRow = {
   email?: string;
   gender?: string;
   physicalCity?: string;
+};
+
+/* Collateral view model */
+type CollateralVM = {
+  key: string;
+  label: string;
+  estValue?: number | null;
+  loanId: string;
+  borrower: string;
+  mobile?: string;
+  area?: string;
+  startMs: number | null;
+  endMs: number | null;
+  daysLeft: number | null;     // positive = days remaining, negative = overdue days * -1
+  overdueDays: number;         // >= 0
+  lateFee: number;             // >= 0
+  currentBalance: number;
+  kycId?: string;
 };
 
 /* =========================================================
@@ -160,10 +183,41 @@ function toDataUrlMaybe(b64?: string) {
   return s.startsWith("data:") ? s : `data:image/jpeg;base64,${s}`;
 }
 
+/* Collateral helpers */
+function collateralLabel(it: any): string {
+  if (typeof it === "string") return it;
+  if (!it || typeof it !== "object") return "Item";
+  return it.label || it.name || it.type || it.kind || it.description || JSON.stringify(it);
+}
+function collateralValue(it: any): number | null {
+  if (!it || typeof it !== "object") return null;
+  const v = it.value ?? it.estimatedValue ?? it.estimate ?? it.price ?? null;
+  const n = typeof v === "string" ? Number(v.replace(/[^\d.]/g, "")) : v;
+  return typeof n === "number" && isFinite(n) ? n : null;
+}
+function daysBetween(aMs: number, bMs: number) {
+  const d = Math.floor((bMs - aMs) / (24*60*60*1000));
+  return d;
+}
+function diffDaysCeil(aMs: number, bMs: number) {
+  // days from now (aMs) to date (bMs), rounded up magnitude
+  const raw = (bMs - aMs) / (24*60*60*1000);
+  return raw >= 0 ? Math.ceil(raw) : -Math.ceil(-raw);
+}
+
 /* =========================================================
    Page
    ========================================================= */
 export default function AdminDashboardPage() {
+  /* --- Global feedback (toast) --- */
+  type Feedback = { kind: "success" | "error" | "info"; message: string } | null;
+  const [feedback, setFeedback] = useState<Feedback>(null);
+  function notify(kind: "success" | "error" | "info", message: string) {
+    setFeedback({ kind, message });
+    window.clearTimeout((notify as any)._t);
+    (notify as any)._t = window.setTimeout(() => setFeedback(null), 4000);
+  }
+
   /* Loans (active) */
   const [loansRaw, setLoansRaw] = useState<Loan[]>([]);
   const [loansLoading, setLoansLoading] = useState(true);
@@ -205,6 +259,7 @@ export default function AdminDashboardPage() {
             areaName: (area ?? "") as string,
             collateralItems: Array.isArray(v.collateralItems) ? v.collateralItems : [],
             loanType: String(v.loanType || "unknown").toLowerCase(),
+            kycId: detectKycId(v),
           };
         });
         setLoansRaw(rows);
@@ -241,6 +296,7 @@ export default function AdminDashboardPage() {
               areaName: (area ?? "") as string,
               collateralItems: Array.isArray(v.collateralItems) ? v.collateralItems : [],
               loanType: String(v.loanType || "unknown").toLowerCase(),
+              kycId: detectKycId(v),
             };
           });
           setLoansRaw(rows);
@@ -264,7 +320,6 @@ export default function AdminDashboardPage() {
     setKycLoading(true);
     setKycError(null);
     const base = collection(db, "kyc_data");
-    // permissive: do not orderBy so we never filter docs out
     const q1 = query(base, fsLimit(500));
     const unsub = onSnapshot(
       q1,
@@ -440,6 +495,50 @@ export default function AdminDashboardPage() {
     return { status, type, frequency };
   }, [loans]);
 
+  /* Collateral flat list (ALL items, mapped to borrower + countdown + late fee) */
+  const collaterals: CollateralVM[] = useMemo(() => {
+    const nowMs = Date.now();
+    const list: CollateralVM[] = [];
+    for (const loan of loans) {
+      const items = Array.isArray(loan.collateralItems) ? loan.collateralItems : [];
+      const startMs = toMillis(loan.timestamp);
+      const endMs = toMillis(loan.endDate);
+      const borrower = fullName({ title: loan.title, firstName: loan.firstName, surname: loan.surname });
+      for (let i = 0; i < items.length; i++) {
+        const it = items[i];
+        const label = collateralLabel(it);
+        const estValue = collateralValue(it);
+        const daysLeft = endMs ? diffDaysCeil(nowMs, endMs) : null;
+        const overdueDays = daysLeft !== null && daysLeft < 0 ? -daysLeft : 0;
+        const lateFee = overdueDays > 0 ? Math.max(0, (loan.currentBalance || 0) * LATE_FEE_DAILY_RATE * overdueDays) : 0;
+        list.push({
+          key: `${loan.id}#${i}`,
+          label,
+          estValue: estValue ?? null,
+          loanId: loan.id,
+          borrower,
+          mobile: loan.mobile,
+          area: loan.areaName || "—",
+          startMs,
+          endMs,
+          daysLeft,
+          overdueDays,
+          lateFee,
+          currentBalance: loan.currentBalance || 0,
+          kycId: loan.kycId,
+        });
+      }
+    }
+    // Sort: overdue (most overdue first), then closest deadlines
+    list.sort((a, b) => {
+      if (a.overdueDays !== b.overdueDays) return b.overdueDays - a.overdueDays;
+      const aDays = a.daysLeft ?? 9e9;
+      const bDays = b.daysLeft ?? 9e9;
+      return aDays - bDays;
+    });
+    return list;
+  }, [loans]);
+
   /* KYC badge */
   const [kycNewCount, setKycNewCount] = useState(0);
   useEffect(() => {
@@ -455,15 +554,13 @@ export default function AdminDashboardPage() {
   const [viewKycId, setViewKycId] = useState<string | null>(null);
   const [viewLoanId, setViewLoanId] = useState<string | null>(null);
 
-  /* Actions for PROCESSED list */
+  /* Actions for PROCESSED list — toasts (no alerts) */
   async function considerBackToActive(p: ProcessedLoan) {
-    // Build payload to restore
     const original = (p as any)?.original;
     let payload: any;
     if (original && typeof original === "object" && Object.keys(original).length) {
-      payload = original; // exact original doc
+      payload = original;
     } else {
-      // Fallback reconstruction
       const nameParts = (p.applicantFull || "").trim().split(/\s+/);
       payload = {
         title: "",
@@ -486,24 +583,27 @@ export default function AdminDashboardPage() {
     try {
       await setDoc(fsDoc(db, "loan_applications", p.id), payload, { merge: false });
       await deleteDoc(fsDoc(db, "processed_loans", p.id));
+      notify("success", "Record restored to Active.");
     } catch (e: any) {
-      alert(`Failed to restore: ${e?.message || e}`);
+      notify("error", `Failed to restore: ${e?.message || e}`);
     }
   }
 
   async function clearProcessed(p: ProcessedLoan) {
     try {
       await updateDoc(fsDoc(db, "processed_loans", p.id), { cleared: true, clearedAt: Date.now() });
+      notify("success", "Record hidden from Processed.");
     } catch (e: any) {
-      alert(`Failed to clear: ${e?.message || e}`);
+      notify("error", `Failed to clear: ${e?.message || e}`);
     }
   }
 
   async function deleteProcessedForever(p: ProcessedLoan) {
     try {
       await deleteDoc(fsDoc(db, "processed_loans", p.id));
+      notify("success", "Processed record deleted.");
     } catch (e: any) {
-      alert(`Failed to delete: ${e?.message || e}`);
+      notify("error", `Failed to delete: ${e?.message || e}`);
     }
   }
 
@@ -518,6 +618,9 @@ export default function AdminDashboardPage() {
 
   return (
     <div className="min-h-screen w-full bg-slate-50">
+      {/* Toast */}
+      <Toast feedback={feedback} onClose={() => setFeedback(null)} />
+
       {/* Header */}
       <header className="sticky top-0 z-20 border-b bg-white/90 backdrop-blur supports-[backdrop-filter]:bg-white/60">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 h-16 flex items-center justify-between">
@@ -544,6 +647,65 @@ export default function AdminDashboardPage() {
             {cards.map((c) => (<KPICard key={c.label} {...c} value={loansLoading ? undefined : c.value} />))}
           </div>
         </section>
+
+        {/* ==================== Collateral Items (ALL) ==================== */}
+        <Section
+          title={
+            <div className="flex items-center gap-2">
+              <span>Collateral Items</span>
+              <span className="text-xs text-slate-500">({num(collaterals.length)} total)</span>
+            </div>
+          }
+        >
+          <ResponsiveTable
+            isLoading={loansLoading}
+            emptyText="No collateral items found."
+            headers={["Item", "Borrower", "Balance", "Dates", "Countdown", "Late Fee", ""]}
+            rows={collaterals.slice(0, 25).map((c) => {
+              const countdown =
+                c.daysLeft === null ? "—" :
+                c.daysLeft > 0 ? `${c.daysLeft} day${c.daysLeft===1?"":"s"} left` :
+                `Overdue by ${c.overdueDays} day${c.overdueDays===1?"":"s"}`;
+
+              const chipClass =
+                c.daysLeft === null ? "bg-slate-100 text-slate-700" :
+                c.daysLeft > 5 ? "bg-emerald-50 text-emerald-700 border-emerald-200" :
+                c.daysLeft >= 0 ? "bg-amber-50 text-amber-700 border-amber-200" :
+                "bg-rose-50 text-rose-700 border-rose-200";
+
+              return [
+                <div key="a">
+                  <div className="font-medium text-slate-900">{c.label}</div>
+                  {typeof c.estValue === "number" && <div className="text-xs text-slate-500">Est. value: MWK {money(c.estValue)}</div>}
+                </div>,
+                <CellPrimary key="b" title={c.borrower || "—"} subtitle={c.mobile || c.area || "—"} />,
+                <span key="c" className="font-medium text-slate-900">MWK {money(c.currentBalance)}</span>,
+                <span key="d" className="text-slate-700">
+                  {fmtDate(c.startMs)} → {fmtDate(c.endMs)}
+                </span>,
+                <span key="e" className={`inline-flex items-center rounded-full border px-2 py-0.5 text-xs ${chipClass}`}>{countdown}</span>,
+                <span key="f" className="font-medium text-slate-900">{c.overdueDays > 0 ? `MWK ${money(Math.ceil(c.lateFee))}` : "—"}</span>,
+                <div key="g" className="flex items-center gap-2">
+                  <button onClick={() => setViewLoanId(c.loanId)} className="rounded-lg border px-2.5 py-1.5 text-xs hover:bg-slate-50">
+                    View loan
+                  </button>
+                  {c.kycId ? (
+                    <Link href={`/kyc/${c.kycId}`} className="rounded-lg bg-blue-600 text-white px-2.5 py-1.5 text-xs hover:bg-blue-700">
+                      Open KYC
+                    </Link>
+                  ) : (
+                    <button disabled className="rounded-lg border px-2.5 py-1.5 text-xs opacity-60" title="No KYC mapped">
+                      Open KYC
+                    </button>
+                  )}
+                </div>,
+              ];
+            })}
+          />
+          {collaterals.length > 25 && (
+            <div className="mt-2 text-xs text-slate-500">Showing 25 of {num(collaterals.length)}. Narrow your query if needed.</div>
+          )}
+        </Section>
 
         {/* Loan Detailed Overview */}
         <section className="rounded-2xl border bg-white p-4 sm:p-6">
@@ -625,12 +787,23 @@ export default function AdminDashboardPage() {
             <ListCards
               isLoading={loansLoading}
               emptyText="No overdue loans with collateral."
-              items={overdueWithCollateral.map((r) => ({
-                title: fullName(r),
-                chips: [`MWK ${money(r.currentBalance || 0)}`, `${r.collateralItems?.length || 0} item(s)`],
-                meta: `Overdue since ${fmtDate(r.endDate as any)} · ${r.areaName || "—"}`,
-                onClick: () => setViewLoanId(r.id),
-              }))}
+              items={overdueWithCollateral.map((r) => {
+                const nowMs = Date.now();
+                const endMs = toMillis(r.endDate) || 0;
+                const overdueDays = endMs ? Math.max(0, -diffDaysCeil(nowMs, endMs)) : 0;
+                const lateFee = overdueDays > 0 ? Math.max(0, (r.currentBalance || 0) * LATE_FEE_DAILY_RATE * overdueDays) : 0;
+                return {
+                  title: fullName(r),
+                  chips: [
+                    `MWK ${money(r.currentBalance || 0)}`,
+                    `${r.collateralItems?.length || 0} item(s)`,
+                    `Overdue ${overdueDays}d`,
+                    `Late Fee MWK ${money(Math.ceil(lateFee))}`,
+                  ],
+                  meta: `Since ${fmtDate(r.endDate as any)} · ${r.areaName || "—"}`,
+                  onClick: () => setViewLoanId(r.id),
+                };
+              })}
             />
           </Section>
 
@@ -676,7 +849,6 @@ export default function AdminDashboardPage() {
                       <div className="text-xs text-slate-600 mt-1">{(k.mobile || "—")}{k.email ? ` · ${k.email}` : ""}</div>
                     </div>
                     <div className="flex items-center gap-2">
-                      {/* FIXED: route to /kyc/[id] */}
                       <Link href={`/kyc/${k.id}`} className="rounded-lg border px-2.5 py-1.5 text-xs hover:bg-slate-50">Open page</Link>
                       <button onClick={() => setViewKycId(k.id)} className="rounded-lg bg-blue-600 text-white px-2.5 py-1.5 text-xs hover:bg-blue-700">View KYC</button>
                     </div>
@@ -718,7 +890,6 @@ export default function AdminDashboardPage() {
                       </div>
 
                       <div className="flex items-center gap-2">
-                        {/* CONSIDER (restore) */}
                         <button
                           onClick={async () => {
                             if (!confirm("Move back to Active (loan_applications)?")) return;
@@ -730,7 +901,6 @@ export default function AdminDashboardPage() {
                           Consider
                         </button>
 
-                        {/* CLEAR (hide) */}
                         <button
                           onClick={async () => {
                             if (!confirm("Hide this record from Processed (not deleted)?")) return;
@@ -742,7 +912,6 @@ export default function AdminDashboardPage() {
                           Clear
                         </button>
 
-                        {/* DELETE FOREVER */}
                         <button
                           onClick={async () => {
                             if (!confirm("Delete this processed record forever?")) return;
@@ -779,7 +948,7 @@ export default function AdminDashboardPage() {
         )}
       </main>
 
-      <LoanPreviewModal loanId={viewLoanId} onClose={() => setViewLoanId(null)} />
+      <LoanPreviewModal loanId={viewLoanId} onClose={() => setViewLoanId(null)} onFeedback={notify} />
     </div>
   );
 }
@@ -787,9 +956,17 @@ export default function AdminDashboardPage() {
 /* =========================================================
    Loan Preview Modal (moves to processed on Accept/Decline)
    ========================================================= */
-function LoanPreviewModal({ loanId, onClose }: { loanId: string | null; onClose: () => void; }) {
+function LoanPreviewModal({
+  loanId,
+  onClose,
+  onFeedback,
+}: {
+  loanId: string | null;
+  onClose: () => void;
+  onFeedback?: (kind: "success" | "error" | "info", message: string) => void;
+}) {
   const [data, setData] = useState<any>(null);
-  const [loanRaw, setLoanRaw] = useState<any>(null); // raw loan for copy
+  const [loanRaw, setLoanRaw] = useState<any>(null);
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState<"accept" | "decline" | "notify" | null>(null);
@@ -885,7 +1062,6 @@ function LoanPreviewModal({ loanId, onClose }: { loanId: string | null; onClose:
     setBusy(busyKey);
     try {
       try { await updateDoc(fsDoc(db, "loan_applications", loanId), { status: next }); } catch {}
-
       const processedDoc: ProcessedLoan & Record<string, any> = {
         id: loanId,
         applicantFull: data.applicantFull || "—",
@@ -906,9 +1082,10 @@ function LoanPreviewModal({ loanId, onClose }: { loanId: string | null; onClose:
 
       await setDoc(fsDoc(db, "processed_loans", loanId), processedDoc);
       await deleteDoc(fsDoc(db, "loan_applications", loanId));
+      onFeedback?.("success", next === "approved" ? "Application approved." : "Application declined.");
       onClose();
     } catch (e: any) {
-      alert(`Failed to move to processed: ${e?.message || e}`);
+      onFeedback?.("error", `Failed to move to Processed: ${e?.message || e}`);
     } finally {
       setBusy(null);
     }
@@ -1100,7 +1277,7 @@ function NotifyEmailModal({
 }
 
 /* =========================================================
-   KYC Preview Modal (with images + fixed link path)
+   KYC Preview Modal (includes images)
    ========================================================= */
 function KycPreviewModal({ kycId, onClose }: { kycId: string | null; onClose: () => void; }) {
   const [data, setData] = useState<any>(null);
@@ -1170,74 +1347,29 @@ function KycPreviewModal({ kycId, onClose }: { kycId: string | null; onClose: ()
                   <div className="mt-4">
                     <div className="text-sm font-medium text-slate-800 mb-2">Identity Images</div>
                     <div className="grid gap-3 sm:grid-cols-3">
-                      {/* ID Front */}
                       {data?.idFrontImageBase64 ? (
                         <div className="rounded-lg border p-2 bg-slate-50">
                           <div className="text-xs text-slate-600 mb-1">ID Front</div>
-                          <img
-                            src={toDataUrlMaybe(data.idFrontImageBase64)}
-                            alt="ID Front"
-                            className="w-full h-36 object-cover rounded-md border bg-white"
-                          />
-                          <a
-                            href={toDataUrlMaybe(data.idFrontImageBase64)}
-                            download={`kyc-${data?.id || "doc"}-id-front.jpg`}
-                            className="mt-2 inline-flex text-xs text-blue-700 hover:underline"
-                          >
-                            Download
-                          </a>
+                          <img src={toDataUrlMaybe(data.idFrontImageBase64)} alt="ID Front" className="w-full h-36 object-cover rounded-md border bg-white" />
+                          <a href={toDataUrlMaybe(data.idFrontImageBase64)} download={`kyc-${data?.id || "doc"}-id-front.jpg`} className="mt-2 inline-flex text-xs text-blue-700 hover:underline">Download</a>
                         </div>
-                      ) : (
-                        <div className="rounded-lg border p-2 bg-slate-50 text-xs text-slate-500 grid place-items-center">
-                          No ID Front
-                        </div>
-                      )}
+                      ) : <div className="rounded-lg border p-2 bg-slate-50 text-xs text-slate-500 grid place-items-center">No ID Front</div>}
 
-                      {/* ID Back */}
                       {data?.idBackImageBase64 ? (
                         <div className="rounded-lg border p-2 bg-slate-50">
                           <div className="text-xs text-slate-600 mb-1">ID Back</div>
-                          <img
-                            src={toDataUrlMaybe(data.idBackImageBase64)}
-                            alt="ID Back"
-                            className="w-full h-36 object-cover rounded-md border bg-white"
-                          />
-                          <a
-                            href={toDataUrlMaybe(data.idBackImageBase64)}
-                            download={`kyc-${data?.id || "doc"}-id-back.jpg`}
-                            className="mt-2 inline-flex text-xs text-blue-700 hover:underline"
-                          >
-                            Download
-                          </a>
+                          <img src={toDataUrlMaybe(data.idBackImageBase64)} alt="ID Back" className="w-full h-36 object-cover rounded-md border bg-white" />
+                          <a href={toDataUrlMaybe(data.idBackImageBase64)} download={`kyc-${data?.id || "doc"}-id-back.jpg`} className="mt-2 inline-flex text-xs text-blue-700 hover:underline">Download</a>
                         </div>
-                      ) : (
-                        <div className="rounded-lg border p-2 bg-slate-50 text-xs text-slate-500 grid place-items-center">
-                          No ID Back
-                        </div>
-                      )}
+                      ) : <div className="rounded-lg border p-2 bg-slate-50 text-xs text-slate-500 grid place-items-center">No ID Back</div>}
 
-                      {/* Selfie */}
                       {data?.selfieImageBase64 ? (
                         <div className="rounded-lg border p-2 bg-slate-50">
                           <div className="text-xs text-slate-600 mb-1">Selfie</div>
-                          <img
-                            src={toDataUrlMaybe(data.selfieImageBase64)}
-                            alt="Selfie"
-                            className="w-full h-36 object-cover rounded-md border bg-white"
-                          />
-                          <a
-                            href={toDataUrlMaybe(data.selfieImageBase64)}
-                            download={`kyc-${data?.id || "doc"}-selfie.jpg`}
-                            className="mt-2 inline-flex text-xs text-blue-700 hover:underline"
-                          >
-                            Download
-                          </a>
+                          <img src={toDataUrlMaybe(data.selfieImageBase64)} alt="Selfie" className="w-full h-36 object-cover rounded-md border bg-white" />
+                          <a href={toDataUrlMaybe(data.selfieImageBase64)} download={`kyc-${data?.id || "doc"}-selfie.jpg`} className="mt-2 inline-flex text-xs text-blue-700 hover:underline">Download</a>
                         </div>
-                      ) : (
-                        <div className="rounded-lg border p-2 bg-slate-50 text-xs text-slate-500 grid place-items-center">
-                          No Selfie
-                        </div>
-                      )}
+                      ) : <div className="rounded-lg border p-2 bg-slate-50 text-xs text-slate-500 grid place-items-center">No Selfie</div>}
                     </div>
                   </div>
                 )}
@@ -1245,7 +1377,6 @@ function KycPreviewModal({ kycId, onClose }: { kycId: string | null; onClose: ()
             )}
           </div>
           <div className="p-4 border-t text-right">
-            {/* FIXED: route to /kyc/[id] */}
             <Link href={`/kyc/${kycId}`} className="inline-flex items-center rounded-lg bg-blue-600 text-white px-3 py-1.5 text-sm hover:bg-blue-700">
               Open Full KYC
             </Link>
@@ -1447,6 +1578,25 @@ function KV({ label, value }: { label: string; value: React.ReactNode }) {
     <div className="flex items-start gap-3">
       <div className="w-40 shrink-0 text-slate-500">{label}</div>
       <div className="text-slate-900">{value}</div>
+    </div>
+  );
+}
+
+/* ===== Toast ===== */
+function Toast({ feedback, onClose }: { feedback: { kind: "success" | "error" | "info"; message: string } | null; onClose: () => void; }) {
+  if (!feedback) return null;
+  const tint =
+    feedback.kind === "success" ? "bg-emerald-50 border-emerald-200 text-emerald-900" :
+    feedback.kind === "error"   ? "bg-rose-50 border-rose-200 text-rose-900" :
+                                  "bg-blue-50 border-blue-200 text-blue-900";
+  return (
+    <div className="fixed top-3 right-3 z-50 max-w-sm">
+      <div className={`rounded-lg border px-3 py-2 shadow ${tint}`}>
+        <div className="flex items-start gap-3">
+          <div className="text-sm leading-5">{feedback.message}</div>
+          <button onClick={onClose} className="text-xs opacity-60 hover:opacity-100">✕</button>
+        </div>
+      </div>
     </div>
   );
 }
