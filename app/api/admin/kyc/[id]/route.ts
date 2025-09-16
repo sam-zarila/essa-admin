@@ -5,15 +5,24 @@ export const runtime = "nodejs";
 
 export async function GET(
   _req: NextRequest,
-  { params }: { params: { id: string } }
+  { params }: { params: Promise<{ id: string }> } // <- params is a Promise now
 ) {
-  const db = adminDb();
-  const doc = await db.collection("kyc_data").doc(params.id).get();
+  const { id } = await params;
 
-  if (!doc.exists) {
-    return NextResponse.json({ error: "Not found" }, { status: 404 });
+  if (!id) {
+    return NextResponse.json({ error: "Missing id" }, { status: 400 });
   }
 
-  return NextResponse.json({ id: doc.id, ...doc.data() });
-}
+  try {
+    const db = adminDb();
+    const doc = await db.collection("kyc_data").doc(id).get();
 
+    if (!doc.exists) {
+      return NextResponse.json({ error: "Not found" }, { status: 404 });
+    }
+
+    return NextResponse.json({ id: doc.id, ...doc.data() });
+  } catch (err) {
+    return NextResponse.json({ error: "Server error" }, { status: 500 });
+  }
+}

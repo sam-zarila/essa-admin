@@ -1,16 +1,16 @@
 // app/api/admin/kyc/route.ts
 export const runtime = "nodejs";
 
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import { adminDb } from "@/app/lib/firebase-admin";
 
-export async function GET(req: Request) {
+export async function GET(req: NextRequest) {
   try {
     const db = adminDb();
 
     const { searchParams } = new URL(req.url);
     const id = searchParams.get("id");
-    const limit = Number(searchParams.get("limit") || 50);
+    const limit = Math.max(1, Math.min(200, Number(searchParams.get("limit") || 50)));
 
     // ----- Single KYC doc (for the modal) -----
     if (id) {
@@ -22,22 +22,20 @@ export async function GET(req: Request) {
     }
 
     // ----- List KYC docs -----
-    let q = db.collection("kyc_data");
-    // Try to order by createdAt/timestamp if they exist; otherwise, just limit
-    try {
-      q = q.orderBy("createdAt", "desc");
-    } catch {}
-    try {
-      q = q.orderBy("timestamp", "desc");
-    } catch {}
+    const col = db.collection("kyc_data");
 
-    let snap;
-    try {
-      snap = await q.limit(limit).get();
-    } catch (e) {
-      console.warn("[/api/admin/kyc] orderBy failed, fallback to simple .limit():", e);
-      snap = await db.collection("kyc_data").limit(limit).get();
-    }
+    // Decide which field to sort on (fallback from createdAt -> timestamp)
+    const probe = await col.limit(1).get();
+    const hasCreatedAt = probe.docs[0]?.get("createdAt") !== undefined;
+    const sortField = hasCreatedAt ? "createdAt" : "timestamp";
+
+    // IMPORTANT: type q as a Query so .orderBy() reassignment is valid
+    let q: FirebaseFirestore.Query<FirebaseFirestore.DocumentData> = col.orderBy(
+      sortField as string,
+      "desc"
+    );
+
+    const snap = await q.limit(limit).get();
 
     const items = snap.docs.map((d) => {
       const v = d.data() as any;
@@ -55,7 +53,7 @@ export async function GET(req: Request) {
         gender: v.gender ?? "",
         physicalCity: v.physicalCity ?? v.areaName ?? "",
         createdAt,
-      } as const;
+      };
     });
 
     return NextResponse.json({ items, updatedAt: Date.now() });
