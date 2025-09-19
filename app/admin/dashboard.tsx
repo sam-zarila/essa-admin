@@ -6,6 +6,7 @@ import type React from "react";
 import Link from "next/link";
 import {
   collection,
+  collectionGroup,
   doc as fsDoc,
   getDoc,
   limit as fsLimit,
@@ -17,6 +18,7 @@ import {
   updateDoc,
   setDoc,
   deleteDoc,
+  serverTimestamp,
 } from "firebase/firestore";
 import emailjs from "@emailjs/browser";
 import { db } from "../lib/firebase";
@@ -69,6 +71,23 @@ type ProcessedLoan = {
   endMs?: number | null;
   original?: any;
   cleared?: boolean;
+};
+
+/* NEW: calculator proposal type */
+type CalcProposal = {
+  id: string;
+  path: string;             // full doc path for updates
+  userId: string;
+  loanType: string;
+  loanAmount: number;
+  months: number;
+  monthlyInstallment?: number;
+  totalAmountPaid?: number;
+  netReceived?: number;
+  eir?: number;
+  timestamp?: any;
+  decision?: { status?: string; note?: string; byUid?: string; byEmail?: string; at?: any } | null;
+  results?: any;
 };
 
 type Totals = {
@@ -125,12 +144,12 @@ function toMillis(v: any): number | null {
     if (typeof v === "number") return isFinite(v) ? v : null;
     if (typeof v === "string") { const n = Date.parse(v); return isFinite(n) ? n : null; }
     if (isFirestoreTs(v)) return v.toDate().getTime();
-    if (typeof v === "object" && "seconds" in v && typeof v.seconds === "number") return Math.round(v.seconds * 1000);
+    if (typeof v === "object" && "seconds" in v && typeof (v as any).seconds === "number") return Math.round((v as any).seconds * 1000);
   } catch {}
   return null;
 }
-function g(obj: any, path: string) { return path.split(".").reduce((v, k) => (v == null ? v : v[k]), obj); }
-function firstDefined<T = any>(...vals: T[]) { for (const v of vals) if (v !== undefined && v !== null && v !== "") return v; }
+function g(obj: any, path: string) { return path.split(".").reduce((v, k) => (v == null ? v : (v as any)[k]), obj as any); }
+function firstDefined<T = any>(...vals: T[]) { for (const v of vals) if (v !== undefined && v !== null && (v as any) !== "") return v; }
 function extractNameArea(v: any): { first?: string; last?: string; area?: string } {
   const first = firstDefined(v.firstName, v.applicantFirstName, v.givenName, g(v,"name.first"), g(v,"applicant.name.first"))
     || (typeof v?.name === "string" && v.name.trim() ? v.name.trim().split(/\s+/).slice(0, -1).join(" ") : undefined);
@@ -168,7 +187,7 @@ function nameKey(first?: string, last?: string) { const f=(first||"").trim().toL
 function detectKycId(loan: any): string | undefined {
   const id = firstDefined(loan.kycId, loan.kyc_id, loan.kycID, loan.applicantId, loan.applicant_id, loan.applicantID, loan.userId, loan.uid, loan.customerId, loan.customer_id, g(loan,"customer.id"), g(loan,"applicant.id")) || undefined;
   const ref = firstDefined(g(loan,"kycRef"), g(loan,"applicantRef"));
-  if (!id && ref && typeof ref.id === "string") return ref.id;
+  if (!id && ref && typeof (ref as any).id === "string") return (ref as any).id;
   return id ? String(id) : undefined;
 }
 const STATUS_PALETTE: Record<string, string> = { pending:"#f59e0b", approved:"#0ea5e9", active:"#22c55e", overdue:"#ef4444", closed:"#6b7280", declined:"#ef4444", unknown:"#94a3b8" };
@@ -191,22 +210,22 @@ function collateralImageUrl(it: any): string | null {
   if (typeof it === "string") return isUrlLike(it) ? it : null;
   if (typeof it === "object") {
     const cand =
-      it.imageUrl || it.photoUrl || it.pictureUrl || it.thumbnail || it.thumbUrl ||
-      it.url || it.image || it.photo || it.picture;
+      (it as any).imageUrl || (it as any).photoUrl || (it as any).pictureUrl || (it as any).thumbnail || (it as any).thumbUrl ||
+      (it as any).url || (it as any).image || (it as any).photo || (it as any).picture;
     if (typeof cand === "string" && isUrlLike(cand)) return cand;
 
-    const b64 = it.imageBase64 || it.photoBase64 || it.pictureBase64 || it.thumbnailBase64;
+    const b64 = (it as any).imageBase64 || (it as any).photoBase64 || (it as any).pictureBase64 || (it as any).thumbnailBase64;
     if (typeof b64 === "string" && b64.trim()) return toDataUrlMaybe(b64);
 
     const arrCand =
-      (Array.isArray(it.images) && it.images[0]) ||
-      (Array.isArray(it.photos) && it.photos[0]) ||
-      (Array.isArray(it.pictures) && it.pictures[0]);
+      (Array.isArray((it as any).images) && (it as any).images[0]) ||
+      (Array.isArray((it as any).photos) && (it as any).photos[0]) ||
+      (Array.isArray((it as any).pictures) && (it as any).pictures[0]);
     if (typeof arrCand === "string" && isUrlLike(arrCand)) return arrCand;
     if (arrCand && typeof arrCand === "object") {
-      const nestedUrl = arrCand.url || arrCand.imageUrl || arrCand.photoUrl || arrCand.src;
+      const nestedUrl = (arrCand as any).url || (arrCand as any).imageUrl || (arrCand as any).photoUrl || (arrCand as any).src;
       if (typeof nestedUrl === "string" && isUrlLike(nestedUrl)) return nestedUrl;
-      const nestedB64 = arrCand.base64 || arrCand.imageBase64;
+      const nestedB64 = (arrCand as any).base64 || (arrCand as any).imageBase64;
       if (typeof nestedB64 === "string" && nestedB64.trim()) return toDataUrlMaybe(nestedB64);
     }
   }
@@ -217,15 +236,15 @@ function collateralLabel(it: any): string {
   if (typeof it === "string") return it;
   if (typeof it === "object") {
     return (
-      it.label || it.name || it.title || it.model || it.description ||
-      `${it.make ? it.make + " " : ""}${it.model ? it.model : "Item"}`
+      (it as any).label || (it as any).name || (it as any).title || (it as any).model || (it as any).description ||
+      `${(it as any).make ? (it as any).make + " " : ""}${(it as any).model ? (it as any).model : "Item"}`
     );
   }
   return "Collateral item";
 }
 function collateralValue(it: any): number | undefined {
   if (!it || typeof it !== "object") return undefined;
-  const v = it.value || it.estimatedValue || it.estValue || it.amount || it.price;
+  const v = (it as any).value || (it as any).estimatedValue || (it as any).estValue || (it as any).amount || (it as any).price;
   return typeof v === "number" ? v : undefined;
 }
 
@@ -375,12 +394,14 @@ export default function AdminDashboardPage() {
   const kycIndex = useMemo(() => {
     const byPhone = new Map<string, KycRow>();
     const byName = new Map<string, KycRow>();
+    const byId   = new Map<string, KycRow>();
     for (const k of kycPending) {
       for (const key of phoneKeys(k.mobile)) byPhone.set(key, k);
       const nk = nameKey(k.firstName, k.lastName);
       if (nk) byName.set(nk, k);
+      if (k.id) byId.set(k.id, k);
     }
-    return { byPhone, byName };
+    return { byPhone, byName, byId };
   }, [kycPending]);
 
   const loans: Loan[] = useMemo(() => {
@@ -455,6 +476,116 @@ export default function AdminDashboardPage() {
     return () => unsub();
   }, []);
 
+  /* ========= Loan Issuing (calculator proposals) — simple fetch, no filters/order ========= */
+  const [issuing, setIssuing] = useState<CalcProposal[]>([]);
+  const [issuingLoading, setIssuingLoading] = useState(true);
+  const [issuingError, setIssuingError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setIssuingLoading(true);
+    setIssuingError(null);
+
+    // simple collectionGroup with a limit — no where/orderBy
+    const qy = query(collectionGroup(db, "calculations"), fsLimit(200));
+
+    const unsub = onSnapshot(
+      qy,
+      (snap) => {
+        const rows: CalcProposal[] = snap.docs.map((d) => {
+          const v = d.data() as any;
+          return {
+            id: d.id,
+            path: d.ref.path,
+            userId: String(v.userId || ""),
+            loanType: String(v.loanType || "unknown"),
+            loanAmount: Number(v.loanAmount || 0),
+            months: Number(v.months || 0),
+            monthlyInstallment: Number(v.monthlyInstallment ?? v.results?.monthlyInstallment ?? 0),
+            totalAmountPaid: Number(v.totalAmountPaid ?? v.results?.totalAmountPaid ?? 0),
+            netReceived: Number(v.netReceived ?? v.results?.netReceived ?? 0),
+            eir: Number(v.eir ?? v.results?.eir ?? 0),
+            timestamp: v.timestamp ?? null,
+            decision: v.decision || null,
+            results: v.results || null,
+          };
+        });
+
+        // optional: local sort newest first (remove next line if you want literal arrival order)
+        rows.sort((a, b) => (toMillis(b.timestamp) ?? 0) - (toMillis(a.timestamp) ?? 0));
+
+        setIssuing(rows);
+        setIssuingLoading(false);
+      },
+      async (err) => {
+        // fallback to one-shot getDocs if listener fails
+        try {
+          const snap = await getDocs(qy);
+          const rows: CalcProposal[] = snap.docs.map((d) => {
+            const v = d.data() as any;
+            return {
+              id: d.id,
+              path: d.ref.path,
+              userId: String(v.userId || ""),
+              loanType: String(v.loanType || "unknown"),
+              loanAmount: Number(v.loanAmount || 0),
+              months: Number(v.months || 0),
+              monthlyInstallment: Number(v.monthlyInstallment ?? v.results?.monthlyInstallment ?? 0),
+              totalAmountPaid: Number(v.totalAmountPaid ?? v.results?.totalAmountPaid ?? 0),
+              netReceived: Number(v.netReceived ?? v.results?.netReceived ?? 0),
+              eir: Number(v.eir ?? v.results?.eir ?? 0),
+              timestamp: v.timestamp ?? null,
+              decision: v.decision || null,
+              results: v.results || null,
+            };
+          });
+          rows.sort((a, b) => (toMillis(b.timestamp) ?? 0) - (toMillis(a.timestamp) ?? 0)); // optional
+          setIssuing(rows);
+          setIssuingLoading(false);
+        } catch (e: any) {
+          setIssuingError(e?.message || "Failed to fetch calculator proposals.");
+          setIssuingLoading(false);
+        }
+      }
+    );
+
+    return () => unsub();
+  }, []);
+
+  async function decideProposal(p: CalcProposal, status: "approved" | "denied") {
+    try {
+      const note = (typeof window !== "undefined") ? window.prompt(`Optional note for ${status.toUpperCase()} decision:`, "") : "";
+      // Update the calc doc decision
+      await updateDoc(fsDoc(db, p.path), {
+        "decision.status": status,
+        "decision.note": note || null,
+        "decision.byUid": "admin",
+        "decision.byEmail": "admin@essa.loans",
+        "decision.at": serverTimestamp(),
+      });
+
+      // Audit copy
+      await setDoc(fsDoc(db, "loan_issuing", p.id), {
+        calcPath: p.path,
+        calcId: p.id,
+        userId: p.userId,
+        loanType: p.loanType,
+        loanAmount: p.loanAmount,
+        months: p.months,
+        monthlyInstallment: p.monthlyInstallment ?? null,
+        totalAmountPaid: p.totalAmountPaid ?? null,
+        netReceived: p.netReceived ?? null,
+        eir: p.eir ?? null,
+        status,
+        note: note || null,
+        decidedAt: Date.now(),
+      }, { merge: true });
+
+      pushFeedback("success", `Proposal ${status === "approved" ? "approved" : "denied"} successfully.`);
+    } catch (e: any) {
+      pushFeedback("error", `Failed to update proposal: ${e?.message || e}`);
+    }
+  }
+
   /* Derived slices */
   const outstanding = useMemo(
     () => loans.filter((r) => (r.status === "approved" || r.status === "active") && (r.currentBalance ?? 0) > 0)
@@ -500,7 +631,7 @@ export default function AdminDashboardPage() {
       collateralCount: loans.reduce((s, r) => s + (r.collateralItems?.length ?? 0), 0),
       finishedCount: finished.length,
       overdueCount: loans.filter(r => { const end = r.endDate ? new Date(r.endDate) : null; return end && end < now && (r.currentBalance ?? 0) > 0; }).length,
-    }),
+    } ),
     [loans, outstanding, finished, now]
   );
 
@@ -681,7 +812,38 @@ export default function AdminDashboardPage() {
           </div>
         </section>
 
-        {/* NEW: Collateral Items (top) */}
+        {/* Loan Issuing (from calculator) */}
+        <Section title="Loan Issuing (from calculator)">
+          <ResponsiveTable
+            isLoading={issuingLoading}
+            emptyText="No proposals found."
+            headers={["Applicant", "Proposal", "Period", "Net Received", "EIR", "Created", "Actions"]}
+            rows={issuing.map((p) => {
+              const k = kycIndex.byId.get(p.userId);
+              const name = k ? [k.firstName, k.lastName].filter(Boolean).join(" ") : `User: ${p.userId}`;
+              return [
+                <CellPrimary key="a" title={name || "—"} subtitle={k?.mobile || k?.email || "—"} />,
+                <div key="b">
+                  <div className="font-medium text-slate-900">{String(p.loanType || "").toUpperCase()}</div>
+                  <div className="text-xs text-slate-600">MWK {money(p.loanAmount)}</div>
+                </div>,
+                <span key="c" className="text-slate-700">{p.months} mo</span>,
+                <span key="d" className="font-medium text-slate-900">MWK {money(p.netReceived || 0)}</span>,
+                <span key="e" className="text-slate-700">{isFinite(p.eir || 0) ? `${(p.eir || 0).toFixed(2)}%` : "—"}</span>,
+                <span key="f" className="text-slate-700">{fmtMaybeDate(p.timestamp)}</span>,
+                <div key="g" className="flex items-center gap-2">
+                  <button onClick={() => decideProposal(p, "approved")} className="rounded-lg bg-emerald-600 text-white px-2.5 py-1.5 text-xs hover:bg-emerald-700">Approve</button>
+                  <button onClick={() => decideProposal(p, "denied")} className="rounded-lg bg-rose-600 text-white px-2.5 py-1.5 text-xs hover:bg-rose-700">Deny</button>
+                  <button onClick={() => setViewKycId(p.userId)} className="rounded-lg border px-2.5 py-1.5 text-xs hover:bg-slate-50">View KYC</button>
+                  <Link href={`/kyc/${p.userId}`} className="rounded-lg bg-blue-600 text-white px-2.5 py-1.5 text-xs hover:bg-blue-700">Open KYC</Link>
+                </div>,
+              ];
+            })}
+          />
+          {issuingError && <div className="text-xs text-rose-600 mt-2">{issuingError}</div>}
+        </Section>
+
+        {/* Collateral items */}
         <Section title="Collateral items">
           <ResponsiveTable
             isLoading={loansLoading}
@@ -888,7 +1050,7 @@ export default function AdminDashboardPage() {
             <KycPreviewModal kycId={viewKycId} onClose={() => setViewKycId(null)} />
           </Section>
 
-          {/* ========= Processed ========= */}
+          {/* Processed */}
           <Section title="Processed">
             <div className="grid gap-2">
               {processedLoading && <SkeletonLine count={3} />}
@@ -1107,7 +1269,7 @@ function LoanPreviewModal({
         frequency: data.frequency ?? "monthly",
         startMs: data.startMs ?? null,
         endMs: data.endMs ?? null,
-        original: loanRaw || {},
+        original: (await (async () => setLoanRaw ? loanRaw : {}) )(),
         cleared: false,
       };
 
@@ -1298,7 +1460,7 @@ function NotifyEmailModal({
           </div>
 
           <div className="p-4 border-t flex items-center justify-end gap-2">
-            <button type="button" onClick={onClose} className="rounded-lg bg-red-600 text-white border px-3 py-1.5 text-sm hover:bg-red-700">Cancel</button>
+            <Button onClick={onClose} variant="danger">Cancel</Button>
             <button type="submit" disabled={sending} className="rounded-lg bg-blue-600 text-white px-3 py-1.5 text-sm hover:bg-blue-700 disabled:opacity-60">
               {sending ? "Sending…" : "Send Email"}
             </button>
@@ -1306,6 +1468,17 @@ function NotifyEmailModal({
         </form>
       </div>
     </div>
+  );
+}
+
+function Button({ onClick, children, variant = "default" }: { onClick?: () => void; children: React.ReactNode; variant?: "default" | "danger" }) {
+  const cls = variant === "danger"
+    ? "rounded-lg bg-red-600 text-white border px-3 py-1.5 text-sm hover:bg-red-700"
+    : "rounded-lg border px-3 py-1.5 text-sm hover:bg-slate-50";
+  return (
+    <button onClick={onClick} className={cls}>
+      {children}
+    </button>
   );
 }
 
@@ -1459,8 +1632,7 @@ function ResponsiveTable({ isLoading, emptyText, headers, rows }: { isLoading: b
             {!isLoading && rows.length === 0 && (<tr><td className="p-6 text-center text-slate-500" colSpan={headers.length}>{emptyText}</td></tr>)}
             {!isLoading && rows.map((r, i) => (
               <tr key={i} className="border-t">
-                {r.map((c, j) => (<td key={j} className="p-3 align-middle whitespace-nowrap">{c}</td>))}
-              </tr>
+                {r.map((c, j) => (<td key={j} className="p-3 align-middle whitespace-nowrap">{c}</td>))}</tr>
             ))}
           </tbody>
         </table>
