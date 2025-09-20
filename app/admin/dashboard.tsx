@@ -480,6 +480,7 @@ export default function AdminDashboardPage() {
   const [issuing, setIssuing] = useState<CalcProposal[]>([]);
   const [issuingLoading, setIssuingLoading] = useState(true);
   const [issuingError, setIssuingError] = useState<string | null>(null);
+  const [issuingExpanded, setIssuingExpanded] = useState(false); // <— NEW
 
   useEffect(() => {
     setIssuingLoading(true);
@@ -551,20 +552,25 @@ export default function AdminDashboardPage() {
     return () => unsub();
   }, []);
 
-  async function decideProposal(p: CalcProposal, status: "approved" | "denied") {
-    try {
-      const note = (typeof window !== "undefined") ? window.prompt(`Optional note for ${status.toUpperCase()} decision:`, "") : "";
-      // Update the calc doc decision
-      await updateDoc(fsDoc(db, p.path), {
-        "decision.status": status,
-        "decision.note": note || null,
-        "decision.byUid": "admin",
-        "decision.byEmail": "admin@essa.loans",
-        "decision.at": serverTimestamp(),
-      });
+ async function decideProposal(p: CalcProposal, status: "approved" | "denied") {
+  try {
+    const note = (typeof window !== "undefined")
+      ? window.prompt(`Optional note for ${status.toUpperCase()} decision:`, "")
+      : "";
 
-      // Audit copy
-      await setDoc(fsDoc(db, "loan_issuing", p.id), {
+    // 1) Update decision on the calculator doc (source of truth for proposals)
+    await updateDoc(fsDoc(db, p.path), {
+      "decision.status": status,
+      "decision.note": note || null,
+      "decision.byUid": "admin",
+      "decision.byEmail": "admin@essa.loans",
+      "decision.at": serverTimestamp(),
+    });
+
+    // 2) Audit copy
+    await setDoc(
+      fsDoc(db, "loan_issuing", p.id),
+      {
         calcPath: p.path,
         calcId: p.id,
         userId: p.userId,
@@ -578,13 +584,60 @@ export default function AdminDashboardPage() {
         status,
         note: note || null,
         decidedAt: Date.now(),
-      }, { merge: true });
+      },
+      { merge: true }
+    );
 
-      pushFeedback("success", `Proposal ${status === "approved" ? "approved" : "denied"} successfully.`);
-    } catch (e: any) {
-      pushFeedback("error", `Failed to update proposal: ${e?.message || e}`);
+    // 3) If APPROVED → create/merge a loan in loan_applications so it shows in "Outstanding loans"
+    if (status === "approved") {
+      // Try to enrich with KYC (name/phone/area) if we have it
+      const k = kycIndex.byId.get(p.userId);
+      const newLoanPayload: any = {
+        title: "",
+        firstName: k?.firstName || "",
+        surname: k?.lastName || "",
+        mobile: k?.mobile || "",
+        email: k?.email || "",
+        areaName: k?.physicalCity || "",
+        // financials
+        loanAmount: p.loanAmount || 0,
+        currentBalance: p.loanAmount || 0, // start with full balance outstanding
+        loanPeriod: p.months || 0,
+        paymentFrequency: "monthly",
+        loanType: p.loanType || "unknown",
+        status: "approved", // will be picked up by the "Outstanding" list
+        timestamp: serverTimestamp(),
+        // link back
+        kycId: p.userId,
+        calcRefPath: p.path,
+        calcRefId: p.id,
+        calculatorSnapshot: {
+          loanType: p.loanType,
+          loanAmount: p.loanAmount,
+          months: p.months,
+          monthlyInstallment: p.monthlyInstallment ?? null,
+          totalAmountPaid: p.totalAmountPaid ?? null,
+          netReceived: p.netReceived ?? null,
+          eir: p.eir ?? null,
+          decidedAt: Date.now(),
+        },
+      };
+
+      // Use proposal id as loan id (or swap for push id if you prefer)
+      await setDoc(fsDoc(db, "loan_applications", p.id), newLoanPayload, { merge: true });
     }
+
+    pushFeedback(
+      "success",
+      `Proposal ${status === "approved" ? "approved" : "denied"} successfully.${
+        status === "approved" ? " Loan created under Outstanding." : ""
+      }`
+    );
+  } catch (e: any) {
+    pushFeedback("error", `Failed to update proposal: ${e?.message || e}`);
   }
+}
+
 
   /* Derived slices */
   const outstanding = useMemo(
@@ -813,35 +866,53 @@ export default function AdminDashboardPage() {
         </section>
 
         {/* Loan Issuing (from calculator) */}
-        <Section title="Loan Issuing (from calculator)">
-          <ResponsiveTable
-            isLoading={issuingLoading}
-            emptyText="No proposals found."
-            headers={["Applicant", "Proposal", "Period", "Net Received", "EIR", "Created", "Actions"]}
-            rows={issuing.map((p) => {
-              const k = kycIndex.byId.get(p.userId);
-              const name = k ? [k.firstName, k.lastName].filter(Boolean).join(" ") : `User: ${p.userId}`;
-              return [
-                <CellPrimary key="a" title={name || "—"} subtitle={k?.mobile || k?.email || "—"} />,
-                <div key="b">
-                  <div className="font-medium text-slate-900">{String(p.loanType || "").toUpperCase()}</div>
-                  <div className="text-xs text-slate-600">MWK {money(p.loanAmount)}</div>
-                </div>,
-                <span key="c" className="text-slate-700">{p.months} mo</span>,
-                <span key="d" className="font-medium text-slate-900">MWK {money(p.netReceived || 0)}</span>,
-                <span key="e" className="text-slate-700">{isFinite(p.eir || 0) ? `${(p.eir || 0).toFixed(2)}%` : "—"}</span>,
-                <span key="f" className="text-slate-700">{fmtMaybeDate(p.timestamp)}</span>,
-                <div key="g" className="flex items-center gap-2">
-                  <button onClick={() => decideProposal(p, "approved")} className="rounded-lg bg-emerald-600 text-white px-2.5 py-1.5 text-xs hover:bg-emerald-700">Approve</button>
-                  <button onClick={() => decideProposal(p, "denied")} className="rounded-lg bg-rose-600 text-white px-2.5 py-1.5 text-xs hover:bg-rose-700">Deny</button>
-                  <button onClick={() => setViewKycId(p.userId)} className="rounded-lg border px-2.5 py-1.5 text-xs hover:bg-slate-50">View KYC</button>
-                  <Link href={`/kyc/${p.userId}`} className="rounded-lg bg-blue-600 text-white px-2.5 py-1.5 text-xs hover:bg-blue-700">Open KYC</Link>
-                </div>,
-              ];
-            })}
-          />
-          {issuingError && <div className="text-xs text-rose-600 mt-2">{issuingError}</div>}
-        </Section>
+       <Section
+  title="Loan Issuing (from calculator)"
+  extra={
+    <div className="flex items-center gap-2">
+      <Link
+        href="/admin/outstanding"
+        className="rounded-lg border px-2.5 py-1.5 text-xs hover:bg-slate-50"
+      >
+        Open Outstanding
+      </Link>
+      <button
+        onClick={() => setIssuingExpanded((v) => !v)}
+        className="rounded-lg bg-slate-900 text-white px-2.5 py-1.5 text-xs hover:bg-black"
+      >
+        {issuingExpanded ? "Show less" : "Show more"}
+      </button>
+    </div>
+  }
+>
+  <ResponsiveTable
+    isLoading={issuingLoading}
+    emptyText="No pending proposals from calculator."
+    headers={["Applicant", "Proposal", "Period", "Net Received", "EIR", "Created", "Actions"]}
+    rows={(issuingExpanded ? issuing : issuing.slice(0, 4)).map((p) => {
+      const k = kycIndex.byId.get(p.userId);
+      const name = k ? [k.firstName, k.lastName].filter(Boolean).join(" ") : `User: ${p.userId}`;
+      return [
+        <CellPrimary key="a" title={name || "—"} subtitle={k?.mobile || k?.email || "—"} />,
+        <div key="b">
+          <div className="font-medium text-slate-900">{String(p.loanType || "").toUpperCase()}</div>
+          <div className="text-xs text-slate-600">MWK {money(p.loanAmount)}</div>
+        </div>,
+        <span key="c" className="text-slate-700">{p.months} mo</span>,
+        <span key="d" className="font-medium text-slate-900">MWK {money(p.netReceived || 0)}</span>,
+        <span key="e" className="text-slate-700">{isFinite(p.eir || 0) ? `${(p.eir || 0).toFixed(2)}%` : "—"}</span>,
+        <span key="f" className="text-slate-700">{fmtMaybeDate(p.timestamp)}</span>,
+        <div key="g" className="flex items-center gap-2">
+          <button onClick={() => decideProposal(p, "approved")} className="rounded-lg bg-emerald-600 text-white px-2.5 py-1.5 text-xs hover:bg-emerald-700">Approve</button>
+          <button onClick={() => decideProposal(p, "denied")} className="rounded-lg bg-rose-600 text-white px-2.5 py-1.5 text-xs hover:bg-rose-700">Deny</button>
+          <button onClick={() => setViewKycId(p.userId)} className="rounded-lg border px-2.5 py-1.5 text-xs hover:bg-slate-50">View KYC</button>
+          <Link href={`/kyc/${p.userId}`} className="rounded-lg bg-blue-600 text-white px-2.5 py-1.5 text-xs hover:bg-blue-700">Open KYC</Link>
+        </div>,
+      ];
+    })}
+  />
+  {issuingError && <div className="text-xs text-rose-600 mt-2">{issuingError}</div>}
+</Section>
 
         {/* Collateral items */}
         <Section title="Collateral items">
@@ -1248,41 +1319,47 @@ function LoanPreviewModal({
   const endDate = data?.endMs ? new Date(data.endMs).toLocaleDateString() : "—";
   const startStr = data?.startMs ? new Date(data.startMs).toLocaleString() : "—";
 
-  async function moveToProcessed(next: "approved" | "declined") {
-    if (!loanId || !data) return;
-    const busyKey = next === "approved" ? "accept" : "decline";
-    setBusy(busyKey);
+ 
+    async function moveToProcessed(next: "approved" | "declined") {
+  if (!loanId || !data) return;
+  const busyKey = next === "approved" ? "accept" : "decline";
+  setBusy(busyKey);
+  try {
+    // try to reflect status on the source loan (best-effort)
     try {
-      try { await updateDoc(fsDoc(db, "loan_applications", loanId), { status: next }); } catch {}
+      await updateDoc(fsDoc(db, "loan_applications", loanId), { status: next });
+    } catch {}
 
-      const processedDoc: ProcessedLoan & Record<string, any> = {
-        id: loanId,
-        applicantFull: data.applicantFull || "—",
-        mobile: data.mobile || "",
-        email: data.email || "",
-        area: data.area || "—",
-        processedStatus: next,
-        processedAt: Date.now(),
-        loanAmount: data.loanAmount ?? 0,
-        currentBalance: data.currentBalance ?? data.loanAmount ?? 0,
-        period: data.period ?? 0,
-        frequency: data.frequency ?? "monthly",
-        startMs: data.startMs ?? null,
-        endMs: data.endMs ?? null,
-        original: (await (async () => setLoanRaw ? loanRaw : {}) )(),
-        cleared: false,
-      };
+    const processedDoc: ProcessedLoan & Record<string, any> = {
+      id: loanId,
+      applicantFull: data.applicantFull || "—",
+      mobile: data.mobile || "",
+      email: data.email || "",
+      area: data.area || "—",
+      processedStatus: next,
+      processedAt: Date.now(),
+      loanAmount: data.loanAmount ?? 0,
+      currentBalance: data.currentBalance ?? data.loanAmount ?? 0,
+      period: data.period ?? 0,
+      frequency: data.frequency ?? "monthly",
+      startMs: data.startMs ?? null,
+      endMs: data.endMs ?? null,
+      original: loanRaw ?? {},          // ← FIX: just keep the raw snapshot (or empty object)
+      cleared: false,
+    };
 
-      await setDoc(fsDoc(db, "processed_loans", loanId), processedDoc);
-      await deleteDoc(fsDoc(db, "loan_applications", loanId));
-      onFeedback("success", `Loan ${next === "approved" ? "approved" : "declined"} and moved to Processed.`);
-      onClose();
-    } catch (e: any) {
-      onFeedback("error", `Failed to move to processed: ${e?.message || e}`);
-    } finally {
-      setBusy(null);
-    }
+    await setDoc(fsDoc(db, "processed_loans", loanId), processedDoc);
+    await deleteDoc(fsDoc(db, "loan_applications", loanId));
+
+    onFeedback("success", `Loan ${next === "approved" ? "approved" : "declined"} and moved to Processed.`);
+    onClose();
+  } catch (e: any) {
+    onFeedback("error", `Failed to move to processed: ${e?.message || e}`);
+  } finally {
+    setBusy(null);
   }
+}
+
 
   return (
     <div className="fixed inset-0 z-40">
