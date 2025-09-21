@@ -1,8 +1,8 @@
 "use client";
-
 import { useEffect, useMemo, useRef, useState } from "react";
 import type React from "react";
 import Link from "next/link";
+import Image from "next/image";
 import {
   collection,
   collectionGroup,
@@ -18,12 +18,9 @@ import {
   setDoc,
   deleteDoc,
   serverTimestamp,
-  DocumentData,
-  QueryDocumentSnapshot,
 } from "firebase/firestore";
 import emailjs from "@emailjs/browser";
 import { db } from "../lib/firebase";
-
 /* EmailJS config (env or replace placeholders) */
 const EMAILJS_SERVICE_ID =
   process.env.NEXT_PUBLIC_EMAILJS_SERVICE_ID || "YOUR_SERVICE_ID";
@@ -31,17 +28,14 @@ const EMAILJS_TEMPLATE_ID =
   process.env.NEXT_PUBLIC_EMAILJS_TEMPLATE_ID || "YOUR_TEMPLATE_ID";
 const EMAILJS_PUBLIC_KEY =
   process.env.NEXT_PUBLIC_EMAILJS_PUBLIC_KEY || "YOUR_PUBLIC_KEY";
-
 /* Late-fee config (per-day rate; tune via env if needed) */
 const LATE_FEE_DAILY = Number(
   process.env.NEXT_PUBLIC_LATE_FEE_DAILY || 0.001
 ); // 0.1%/day default
-
 /* =========================================================
    Types
    ========================================================= */
 type FireTimestamp = { seconds: number; nanoseconds?: number };
-
 type Loan = {
   id: string;
   title?: string;
@@ -67,7 +61,6 @@ type Loan = {
   timestamp?: Timestamp | FireTimestamp | number | string | Date | null;
   kycId?: string;
 };
-
 type ProcessedLoan = {
   id: string;
   applicantFull?: string;
@@ -85,7 +78,6 @@ type ProcessedLoan = {
   original?: Record<string, unknown> | null;
   cleared?: boolean;
 };
-
 type CalcDecision = {
   status?: string;
   note?: string;
@@ -93,14 +85,12 @@ type CalcDecision = {
   byEmail?: string;
   at?: Timestamp | FireTimestamp | number | string | Date | null;
 };
-
 type CalcResults = {
   monthlyInstallment?: number;
   totalAmountPaid?: number;
   netReceived?: number;
   eir?: number;
 } | null;
-
 type CalcProposal = {
   id: string;
   path: string;
@@ -116,7 +106,6 @@ type CalcProposal = {
   decision?: CalcDecision | null;
   results?: CalcResults;
 };
-
 type Totals = {
   outstandingCount?: number;
   outstandingBalanceSum?: number;
@@ -124,13 +113,11 @@ type Totals = {
   finishedCount?: number;
   overdueCount?: number;
 };
-
 type Breakdown = {
   status?: Record<string, number>;
   type?: Record<string, number>;
   frequency?: Record<string, number>;
 };
-
 type KycRow = {
   id: string;
   firstName?: string;
@@ -141,7 +128,6 @@ type KycRow = {
   gender?: string;
   physicalCity?: string;
 };
-
 type CollateralVM = {
   key: string;
   label: string;
@@ -159,7 +145,6 @@ type CollateralVM = {
   kycId?: string;
   imageUrl?: string | null;
 };
-
 type LoanPreview = {
   id: string;
   applicantFull: string;
@@ -175,28 +160,21 @@ type LoanPreview = {
   endMs: number | null;
   collateralItems: unknown[];
 };
-
 /* =========================================================
    Narrowing helpers (TypeScript-safe)
    ========================================================= */
 type AnyRec = Record<string, unknown>;
 type TsLike = Timestamp | FireTimestamp | number | string | Date | null;
-
 const isObject = (v: unknown): v is Record<string, unknown> =>
   typeof v === "object" && v !== null;
-
 const isTs = (v: unknown): v is Timestamp =>
   isObject(v) && "toDate" in v && typeof (v as { toDate: unknown }).toDate === "function";
-
 const isFireObj = (v: unknown): v is FireTimestamp =>
   isObject(v) && "seconds" in v && typeof (v as { seconds: unknown }).seconds === "number";
-
 const asNumber = (v: unknown): number | undefined =>
   typeof v === "number" && isFinite(v) ? v : undefined;
-
 const asString = (v: unknown): string | undefined =>
   typeof v === "string" ? v : undefined;
-
 function getErrorMessage(e: unknown): string {
   if (e instanceof Error) return e.message;
   if (isObject(e) && "message" in e) {
@@ -209,18 +187,15 @@ function getErrorMessage(e: unknown): string {
     return String(e ?? "Unknown error");
   }
 }
-
 const g = (obj: unknown, path: string): unknown =>
   path.split(".").reduce<unknown>((v, k) => {
     if (!isObject(v)) return undefined;
     return (v as AnyRec)[k];
   }, obj);
-
 function firstDefined<T>(...vals: T[]): T | undefined {
-  for (const v of vals) if (v !== undefined && v !== null && v !== ("" as any)) return v;
+  for (const v of vals) if (v !== undefined && v !== null && (typeof v !== "string" || v !== "")) return v;
   return undefined;
 }
-
 function toMillis(v: unknown): number | null {
   try {
     if (!v) return null;
@@ -237,7 +212,6 @@ function toMillis(v: unknown): number | null {
   }
   return null;
 }
-
 function extractNameArea(v: AnyRec): {
   first?: string;
   last?: string;
@@ -254,7 +228,6 @@ function extractNameArea(v: AnyRec): {
     (typeof v?.name === "string" && v.name.trim()
       ? v.name.trim().split(/\s+/).slice(0, -1).join(" ")
       : undefined);
-
   const last =
     (firstDefined(
       v.surname,
@@ -267,7 +240,6 @@ function extractNameArea(v: AnyRec): {
     (typeof v?.name === "string" && v.name.trim()
       ? v.name.trim().split(/\s+/).slice(-1)[0]
       : undefined);
-
   const area = firstDefined(
     v.areaName,
     v.physicalCity,
@@ -280,10 +252,8 @@ function extractNameArea(v: AnyRec): {
     v.area,
     v.district
   ) as string | undefined;
-
   return { first, last, area };
 }
-
 function computeEndDate(
   ts: unknown,
   period?: number,
@@ -296,7 +266,6 @@ function computeEndDate(
   else end.setMonth(end.getMonth() + period);
   return end;
 }
-
 function fullName(r: {
   title?: string;
   firstName?: string;
@@ -306,7 +275,6 @@ function fullName(r: {
   const last = r.surname ?? r.lastName;
   return [r.title, r.firstName, last].filter(Boolean).join(" ") || "—";
 }
-
 function fmtDate(d?: string | number | Date | null) {
   if (!d) return "—";
   const date = typeof d === "string" || typeof d === "number" ? new Date(d) : d;
@@ -316,7 +284,6 @@ function fmtMaybeDate(v: unknown) {
   const ms = toMillis(v);
   return ms ? new Date(ms).toLocaleDateString() : "—";
 }
-
 function money(n?: number) {
   const v = typeof n === "number" && isFinite(n) ? Math.round(n) : 0;
   try {
@@ -430,7 +397,6 @@ function detectKycId(loan: AnyRec): string | undefined {
     return (ref as AnyRec).id as string;
   return id ? String(id) : undefined;
 }
-
 const STATUS_PALETTE: Record<string, string> = {
   pending: "#f59e0b",
   approved: "#0ea5e9",
@@ -448,7 +414,6 @@ const TYPE_PALETTE: Record<string, string> = {
   school: "#f59e0b",
   unknown: "#94a3b8",
 };
-
 /* Base64/URL helpers for images */
 function toDataUrlMaybe(b64?: string) {
   if (!b64 || typeof b64 !== "string") return "";
@@ -476,24 +441,20 @@ function collateralImageUrl(it: unknown): string | null {
       (it as AnyRec).photo ||
       (it as AnyRec).picture;
     if (typeof cand === "string" && isUrlLike(cand)) return cand;
-
     const b64 =
       (it as AnyRec).imageBase64 ||
       (it as AnyRec).photoBase64 ||
       (it as AnyRec).pictureBase64 ||
       (it as AnyRec).thumbnailBase64;
     if (typeof b64 === "string" && b64.trim()) return toDataUrlMaybe(b64);
-
     // Array candidates — avoid indexing unknown directly
     const images = (it as AnyRec).images;
     const photos = (it as AnyRec).photos;
     const pictures = (it as AnyRec).pictures;
-
     const arrCand =
       (Array.isArray(images) ? images[0] : undefined) ??
       (Array.isArray(photos) ? photos[0] : undefined) ??
       (Array.isArray(pictures) ? pictures[0] : undefined);
-
     if (typeof arrCand === "string" && isUrlLike(arrCand)) return arrCand;
     if (arrCand && typeof arrCand === "object") {
       const nestedUrl =
@@ -502,7 +463,6 @@ function collateralImageUrl(it: unknown): string | null {
         (arrCand as AnyRec).photoUrl ||
         (arrCand as AnyRec).src;
       if (typeof nestedUrl === "string" && isUrlLike(nestedUrl)) return nestedUrl;
-
       const nestedB64 =
         (arrCand as AnyRec).base64 || (arrCand as AnyRec).imageBase64;
       if (typeof nestedB64 === "string" && nestedB64.trim())
@@ -538,7 +498,6 @@ function collateralValue(it: unknown): number | undefined {
     (it as AnyRec).price;
   return asNumber(v);
 }
-
 /* =========================================================
    Page
    ========================================================= */
@@ -555,13 +514,11 @@ export default function AdminDashboardPage() {
     setFeedback({ type, text });
     window.setTimeout(() => setFeedback(null), 4000);
   }
-
   /* Loans (active) */
   const [loansRaw, setLoansRaw] = useState<Loan[]>([]);
   const [loansLoading, setLoansLoading] = useState(true);
   const [loansError, setLoansError] = useState<string | null>(null);
   const [updatedAt, setUpdatedAt] = useState<number | null>(null);
-
   useEffect(() => {
     setLoansLoading(true);
     setLoansError(null);
@@ -574,13 +531,11 @@ export default function AdminDashboardPage() {
           const v = d.data() as AnyRec;
           const { first, last, area } = extractNameArea(v);
           const status = normalizeStatus(asString(v.status));
-
           const paymentFrequency =
             (firstDefined(
               v.paymentFrequency,
               v.frequency
             ) as "weekly" | "monthly" | undefined) ?? "monthly";
-
           const loanPeriod = Number(
             firstDefined(
               v.loanPeriod,
@@ -590,7 +545,6 @@ export default function AdminDashboardPage() {
               v.tenorWeeks
             ) || 0
           );
-
           const startRaw = firstDefined(
             v.timestamp,
             v.startDate,
@@ -600,7 +554,6 @@ export default function AdminDashboardPage() {
             (v as AnyRec)["loanStartDate"]
           );
           const startVal = (startRaw ?? null) as TsLike;
-
           const explicitEnd = firstDefined(
             v.endDate,
             (v as AnyRec)["loanEndDate"],
@@ -614,7 +567,6 @@ export default function AdminDashboardPage() {
             loanPeriod,
             paymentFrequency
           );
-
           return {
             id: d.id,
             firstName: first ?? "",
@@ -658,13 +610,11 @@ export default function AdminDashboardPage() {
             const v = d.data() as AnyRec;
             const { first, last, area } = extractNameArea(v);
             const status = normalizeStatus(asString(v.status));
-
             const paymentFrequency =
               (firstDefined(
                 v.paymentFrequency,
                 v.frequency
               ) as "weekly" | "monthly" | undefined) ?? "monthly";
-
             const loanPeriod = Number(
               firstDefined(
                 v.loanPeriod,
@@ -674,7 +624,6 @@ export default function AdminDashboardPage() {
                 v.tenorWeeks
               ) || 0
             );
-
             const startRaw = firstDefined(
               v.timestamp,
               v.startDate,
@@ -684,7 +633,6 @@ export default function AdminDashboardPage() {
               (v as AnyRec)["loanStartDate"]
             );
             const startVal = (startRaw ?? null) as TsLike;
-
             const explicitEnd = firstDefined(
               v.endDate,
               (v as AnyRec)["loanEndDate"],
@@ -698,7 +646,6 @@ export default function AdminDashboardPage() {
               loanPeriod,
               paymentFrequency
             );
-
             return {
               id: d.id,
               firstName: first ?? "",
@@ -731,7 +678,7 @@ export default function AdminDashboardPage() {
           setLoansRaw(rows);
           setUpdatedAt(Date.now());
           setLoansLoading(false);
-        } catch (e) {
+        } catch (e: unknown) {
           setLoansError(getErrorMessage(e));
           setLoansLoading(false);
         }
@@ -739,12 +686,10 @@ export default function AdminDashboardPage() {
     );
     return () => unsub();
   }, []);
-
   /* KYC (permissive; always fetch something) */
   const [kycPending, setKycPending] = useState<KycRow[]>([]);
   const [kycLoading, setKycLoading] = useState(true);
   const [kycError, setKycError] = useState<string | null>(null);
-
   useEffect(() => {
     setKycLoading(true);
     setKycError(null);
@@ -790,14 +735,13 @@ export default function AdminDashboardPage() {
         setKycPending(rows);
         setKycLoading(false);
       },
-      (e) => {
+      (e: unknown) => {
         setKycError(getErrorMessage(e));
         setKycLoading(false);
       }
     );
     return () => unsub();
   }, []);
-
   /* Enrich loans with KYC */
   const kycIndex = useMemo(() => {
     const byPhone = new Map<string, KycRow>();
@@ -811,7 +755,6 @@ export default function AdminDashboardPage() {
     }
     return { byPhone, byName, byId };
   }, [kycPending]);
-
   const loans: Loan[] = useMemo(() => {
     return loansRaw.map((l) => {
       const out: Loan = { ...l };
@@ -843,12 +786,10 @@ export default function AdminDashboardPage() {
       return out;
     });
   }, [loansRaw, kycIndex]);
-
   /* ========= Processed collection ========= */
   const [processed, setProcessed] = useState<ProcessedLoan[]>([]);
   const [processedLoading, setProcessedLoading] = useState(true);
   const [processedError, setProcessedError] = useState<string | null>(null);
-
   useEffect(() => {
     setProcessedLoading(true);
     setProcessedError(null);
@@ -885,37 +826,31 @@ export default function AdminDashboardPage() {
         setProcessed(rows);
         setProcessedLoading(false);
       },
-      (err) => {
+      (err: unknown) => {
         setProcessedError(getErrorMessage(err));
         setProcessedLoading(false);
       }
     );
     return () => unsub();
   }, []);
-
   /* ========= Loan Issuing (calculator proposals) — simple fetch ========= */
   const [issuing, setIssuing] = useState<CalcProposal[]>([]);
   const [issuingLoading, setIssuingLoading] = useState(true);
   const [issuingError, setIssuingError] = useState<string | null>(null);
   const [issuingExpanded, setIssuingExpanded] = useState(false);
-
   useEffect(() => {
     setIssuingLoading(true);
     setIssuingError(null);
-
     const qy = query(collectionGroup(db, "calculations"), fsLimit(200));
-
     const unsub = onSnapshot(
       qy,
       (snap) => {
         const rows: CalcProposal[] = snap.docs.map((d) => {
   const v = d.data() as AnyRec;
   const res = (v.results as AnyRec | null) || null;
-
   // ✅ sanitize timestamp into a TsLike
   const tsRaw = firstDefined(v.timestamp, v.createdAt, v.created_at);
   const tsVal = (tsRaw ?? null) as TsLike;
-
   return {
     id: d.id,
     path: d.ref.path,
@@ -923,31 +858,25 @@ export default function AdminDashboardPage() {
     loanType: String(v.loanType || "unknown"),
     loanAmount: Number(v.loanAmount || 0),
     months: Number(v.months || 0),
-
     monthlyInstallment: Number(
-      (v as AnyRec)["monthlyInstallment"] ?? res?.monthlyInstallment ?? 0
+      v["monthlyInstallment"] ?? res?.monthlyInstallment ?? 0
     ),
     totalAmountPaid: Number(
-      (v as AnyRec)["totalAmountPaid"] ?? res?.totalAmountPaid ?? 0
+      v["totalAmountPaid"] ?? res?.totalAmountPaid ?? 0
     ),
     netReceived: Number(
-      (v as AnyRec)["netReceived"] ?? res?.netReceived ?? 0
+      v["netReceived"] ?? res?.netReceived ?? 0
     ),
-    eir: Number((v as AnyRec)["eir"] ?? res?.eir ?? 0),
-
+    eir: Number(v["eir"] ?? res?.eir ?? 0),
     // ✅ now typed as Timestamp | FireTimestamp | number | string | Date | null
     timestamp: tsVal,
-
     decision: (v.decision as CalcDecision | undefined) ?? null,
     results: (res as CalcResults) ?? null,
   };
 });
-
-
         rows.sort(
           (a, b) => (toMillis(b.timestamp) ?? 0) - (toMillis(a.timestamp) ?? 0)
         );
-
         setIssuing(rows);
         setIssuingLoading(false);
       },
@@ -957,10 +886,8 @@ export default function AdminDashboardPage() {
           const rows: CalcProposal[] = snap.docs.map((d) => {
   const v = d.data() as AnyRec;
   const res = (v.results as AnyRec | null) || null;
-
   const tsRaw = firstDefined(v.timestamp, v.createdAt, v.created_at);
   const tsVal = (tsRaw ?? null) as TsLike;
-
   return {
     id: d.id,
     path: d.ref.path,
@@ -969,36 +896,33 @@ export default function AdminDashboardPage() {
     loanAmount: Number(v.loanAmount || 0),
     months: Number(v.months || 0),
     monthlyInstallment: Number(
-      (v as AnyRec)["monthlyInstallment"] ?? res?.monthlyInstallment ?? 0
+      v["monthlyInstallment"] ?? res?.monthlyInstallment ?? 0
     ),
     totalAmountPaid: Number(
-      (v as AnyRec)["totalAmountPaid"] ?? res?.totalAmountPaid ?? 0
+      v["totalAmountPaid"] ?? res?.totalAmountPaid ?? 0
     ),
     netReceived: Number(
-      (v as AnyRec)["netReceived"] ?? res?.netReceived ?? 0
+      v["netReceived"] ?? res?.netReceived ?? 0
     ),
-    eir: Number((v as AnyRec)["eir"] ?? res?.eir ?? 0),
+    eir: Number(v["eir"] ?? res?.eir ?? 0),
     timestamp: tsVal,
     decision: (v.decision as CalcDecision | undefined) ?? null,
     results: (res as CalcResults) ?? null,
   };
 });
-
           rows.sort(
             (a, b) => (toMillis(b.timestamp) ?? 0) - (toMillis(a.timestamp) ?? 0)
           );
           setIssuing(rows);
           setIssuingLoading(false);
-        } catch (e) {
+        } catch (e: unknown) {
           setIssuingError(getErrorMessage(e));
           setIssuingLoading(false);
         }
       }
     );
-
     return () => unsub();
   }, []);
-
   async function decideProposal(
     p: CalcProposal,
     status: "approved" | "denied"
@@ -1008,7 +932,6 @@ export default function AdminDashboardPage() {
         typeof window !== "undefined"
           ? window.prompt(`Optional note for ${status.toUpperCase()} decision:`, "")
           : "";
-
       await updateDoc(fsDoc(db, p.path), {
         "decision.status": status,
         "decision.note": note || null,
@@ -1016,7 +939,6 @@ export default function AdminDashboardPage() {
         "decision.byEmail": "admin@essa.loans",
         "decision.at": serverTimestamp(),
       });
-
       await setDoc(
         fsDoc(db, "loan_issuing", p.id),
         {
@@ -1036,7 +958,6 @@ export default function AdminDashboardPage() {
         },
         { merge: true }
       );
-
       if (status === "approved") {
         const k = kycIndex.byId.get(p.userId);
         const newLoanPayload: AnyRec = {
@@ -1071,18 +992,16 @@ export default function AdminDashboardPage() {
           merge: true,
         });
       }
-
       pushFeedback(
         "success",
         `Proposal ${status === "approved" ? "approved" : "denied"} successfully.${
           status === "approved" ? " Loan created under Outstanding." : ""
         }`
       );
-    } catch (e) {
+    } catch (e: unknown) {
       pushFeedback("error", `Failed to update proposal: ${getErrorMessage(e)}`);
     }
   }
-
   /* Derived slices */
   const outstanding = useMemo(
     () =>
@@ -1098,11 +1017,9 @@ export default function AdminDashboardPage() {
     [loans]
   );
   const outstandingTop = useMemo(() => outstanding.slice(0, 6), [outstanding]);
-
   // Updated clock based on updatedAt (avoids useMemo-on-Date anti-pattern)
-  const nowDate = new Date(updatedAt ?? Date.now());
-  const soonDate = new Date((updatedAt ?? Date.now()) + 14 * 24 * 60 * 60 * 1000);
-
+  const nowDate = useMemo(() => new Date(updatedAt ?? Date.now()), [updatedAt]);
+  const soonDate = useMemo(() => new Date((updatedAt ?? Date.now()) + 14 * 24 * 60 * 60 * 1000), [updatedAt]);
   const deadlinesUpcoming = useMemo(
     () =>
       loans
@@ -1124,7 +1041,6 @@ export default function AdminDashboardPage() {
         .slice(0, 8),
     [loans, nowDate, soonDate]
   );
-
   const overdueWithCollateral = useMemo(
     () =>
       loans
@@ -1146,7 +1062,6 @@ export default function AdminDashboardPage() {
         .slice(0, 8),
     [loans, nowDate]
   );
-
   const finished = useMemo(
     () =>
       loans
@@ -1160,7 +1075,6 @@ export default function AdminDashboardPage() {
     [loans]
   );
   const recentApplicants = useMemo(() => loans.slice(0, 8), [loans]);
-
   const totals: Totals = useMemo(
     () => ({
       outstandingCount: outstanding.length,
@@ -1180,7 +1094,6 @@ export default function AdminDashboardPage() {
     }),
     [loans, outstanding, finished, nowDate]
   );
-
   const breakdown: Breakdown = useMemo(() => {
     const status: Record<string, number> = {};
     const type: Record<string, number> = {};
@@ -1192,13 +1105,11 @@ export default function AdminDashboardPage() {
     });
     return { status, type, frequency };
   }, [loans]);
-
   /* Collateral aggregation */
   const collaterals: CollateralVM[] = useMemo(() => {
     const list: CollateralVM[] = [];
     const msDay = 24 * 60 * 60 * 1000;
     const nowMs = Date.now();
-
     for (const loan of loans) {
       const items = Array.isArray(loan.collateralItems)
         ? loan.collateralItems
@@ -1210,7 +1121,6 @@ export default function AdminDashboardPage() {
       const overdueDays = endMs && endMs < nowMs ? Math.ceil((nowMs - endMs) / msDay) : 0;
       const lateFee =
         overdueDays > 0 ? (loan.currentBalance || 0) * LATE_FEE_DAILY * overdueDays : 0;
-
       items.forEach((it, i) => {
         const label = collateralLabel(it);
         const estValue = collateralValue(it);
@@ -1234,10 +1144,8 @@ export default function AdminDashboardPage() {
         });
       });
     }
-
     return list.sort((a, b) => (b.startMs ?? 0) - (a.startMs ?? 0));
   }, [loans]);
-
   /* KYC badge */
   const [kycNewCount, setKycNewCount] = useState(0);
   useEffect(() => {
@@ -1261,11 +1169,9 @@ export default function AdminDashboardPage() {
     localStorage.setItem("kyc_seen_at", String(Date.now()));
     setKycNewCount(0);
   }
-
   /* Modals */
   const [viewKycId, setViewKycId] = useState<string | null>(null);
   const [viewLoanId, setViewLoanId] = useState<string | null>(null);
-
   /* Actions for PROCESSED list */
   async function considerBackToActive(p: ProcessedLoan) {
     const original = p?.original;
@@ -1294,18 +1200,16 @@ export default function AdminDashboardPage() {
         loanType: "unknown",
       };
     }
-
     try {
       await setDoc(fsDoc(db, "loan_applications", p.id), payload, {
         merge: false,
       });
       await deleteDoc(fsDoc(db, "processed_loans", p.id));
       pushFeedback("success", "Moved back to Active successfully.");
-    } catch (e) {
+    } catch (e: unknown) {
       pushFeedback("error", `Failed to restore: ${getErrorMessage(e)}`);
     }
   }
-
   async function clearProcessed(p: ProcessedLoan) {
     try {
       await updateDoc(fsDoc(db, "processed_loans", p.id), {
@@ -1313,20 +1217,18 @@ export default function AdminDashboardPage() {
         clearedAt: Date.now(),
       });
       pushFeedback("success", "Record hidden from Processed.");
-    } catch (e) {
+    } catch (e: unknown) {
       pushFeedback("error", `Failed to clear: ${getErrorMessage(e)}`);
     }
   }
-
   async function deleteProcessedForever(p: ProcessedLoan) {
     try {
       await deleteDoc(fsDoc(db, "processed_loans", p.id));
       pushFeedback("success", "Record deleted permanently.");
-    } catch (e) {
+    } catch (e: unknown) {
       pushFeedback("error", `Failed to delete: ${getErrorMessage(e)}`);
     }
   }
-
   /* Header & KPIs */
   const lastUpdated = updatedAt
     ? timeAgo(new Date(updatedAt))
@@ -1363,7 +1265,6 @@ export default function AdminDashboardPage() {
       tint: "from-emerald-500 to-emerald-600",
     },
   ] as const;
-
   return (
     <div className="min-h-screen w-full bg-slate-50">
       {/* Header */}
@@ -1392,7 +1293,6 @@ export default function AdminDashboardPage() {
           </div>
         </div>
       </header>
-
       {/* Feedback banner */}
       {feedback && (
         <div className={`mx-auto max-w-7xl px-4 sm:px-6 pt-3`}>
@@ -1410,7 +1310,6 @@ export default function AdminDashboardPage() {
           </div>
         </div>
       )}
-
       <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-8">
         {/* KPIs */}
         <section>
@@ -1424,7 +1323,6 @@ export default function AdminDashboardPage() {
             ))}
           </div>
         </section>
-
         {/* Loan Issuing (from calculator) */}
         <Section
           title="Loan Issuing (from calculator)"
@@ -1521,7 +1419,6 @@ export default function AdminDashboardPage() {
             <div className="text-xs text-rose-600 mt-2">{issuingError}</div>
           )}
         </Section>
-
         {/* Collateral items */}
         <Section title="Collateral items">
           <ResponsiveTable
@@ -1546,7 +1443,6 @@ export default function AdminDashboardPage() {
                   : `Overdue by ${c.overdueDays} day${
                       c.overdueDays === 1 ? "" : "s"
                     }`;
-
               const chipClass =
                 c.daysLeft === null
                   ? "bg-slate-100 text-slate-700"
@@ -1555,16 +1451,16 @@ export default function AdminDashboardPage() {
                   : c.daysLeft >= 0
                   ? "bg-amber-50 text-amber-700 border-amber-200"
                   : "bg-rose-50 text-rose-700 border-rose-200";
-
               return [
                 /* IMAGE */
                 <div key="img" className="flex items-center">
                   {c.imageUrl ? (
-                    <img
+                    <Image
                       src={c.imageUrl}
                       alt={c.label}
-                      className="h-14 w-14 object-cover rounded-md border bg-white"
-                      loading="lazy"
+                      width={56}
+                      height={56}
+                      className="object-cover rounded-md border bg-white"
                     />
                   ) : (
                     <div className="h-14 w-14 rounded-md border bg-slate-100 grid place-items-center text-[10px] text-slate-500 px-1 text-center">
@@ -1572,7 +1468,6 @@ export default function AdminDashboardPage() {
                     </div>
                   )}
                 </div>,
-
                 /* ITEM */
                 <div key="a">
                   <div className="font-medium text-slate-900">{c.label}</div>
@@ -1582,7 +1477,6 @@ export default function AdminDashboardPage() {
                     </div>
                   )}
                 </div>,
-
                 <CellPrimary
                   key="b"
                   title={c.borrower || "—"}
@@ -1631,7 +1525,6 @@ export default function AdminDashboardPage() {
             })}
           />
         </Section>
-
         {/* Loan Detailed Overview */}
         <Section
           className="rounded-2xl border bg-white p-4 sm:p-6"
@@ -1705,7 +1598,6 @@ export default function AdminDashboardPage() {
             </div>
           </div>
         </Section>
-
         {/* Main content */}
         <div className="grid gap-4 xl:grid-cols-2">
           <Section title="Outstanding loans (top 6)">
@@ -1729,7 +1621,7 @@ export default function AdminDashboardPage() {
                   {r.areaName || "—"}
                 </span>,
                 <span key="e" className="text-slate-700">
-                  {fmtDate(r.endDate as any)}
+                  {fmtDate(r.endDate)}
                 </span>,
                 <button
                   key="f"
@@ -1741,7 +1633,6 @@ export default function AdminDashboardPage() {
               ])}
             />
           </Section>
-
           <Section title="Deadlines in next 14 days">
             <ListCards
               isLoading={loansLoading}
@@ -1752,12 +1643,11 @@ export default function AdminDashboardPage() {
                   `MWK ${money(r.currentBalance || 0)}`,
                   `${r.loanPeriod}${r.paymentFrequency === "weekly" ? "wk" : "mo"}`,
                 ],
-                meta: `${fmtDate(r.endDate as any)} · ${r.areaName || "—"}`,
+                meta: `${fmtDate(r.endDate )} · ${r.areaName || "—"}`,
                 onClick: () => setViewLoanId(r.id),
               }))}
             />
           </Section>
-
           <Section title="Due for collateral (overdue)">
             <ListCards
               isLoading={loansLoading}
@@ -1768,14 +1658,13 @@ export default function AdminDashboardPage() {
                   `MWK ${money(r.currentBalance || 0)}`,
                   `${r.collateralItems?.length || 0} item(s)`,
                 ],
-                meta: `Overdue since ${fmtDate(r.endDate as any)} · ${
+                meta: `Overdue since ${fmtDate(r.endDate )} · ${
                   r.areaName || "—"
                 }`,
                 onClick: () => setViewLoanId(r.id),
               }))}
             />
           </Section>
-
           <Section title="Finished repayments">
             <ListCards
               isLoading={loansLoading}
@@ -1791,7 +1680,6 @@ export default function AdminDashboardPage() {
               }))}
             />
           </Section>
-
           {/* KYC */}
           <Section
             title={
@@ -1862,7 +1750,6 @@ export default function AdminDashboardPage() {
             </div>
             <KycPreviewModal kycId={viewKycId} onClose={() => setViewKycId(null)} />
           </Section>
-
           {/* Processed */}
           <Section title="Processed">
             <div className="grid gap-2">
@@ -1916,7 +1803,6 @@ export default function AdminDashboardPage() {
                           </div>
                           <div className="text-xs text-slate-500 mt-1">{meta}</div>
                         </div>
-
                         <div className="flex items-center gap-2">
                           <button
                             onClick={async () => {
@@ -1931,7 +1817,6 @@ export default function AdminDashboardPage() {
                           >
                             Consider
                           </button>
-
                           <button
                             onClick={async () => {
                               if (
@@ -1947,7 +1832,6 @@ export default function AdminDashboardPage() {
                           >
                             Clear
                           </button>
-
                           <button
                             onClick={async () => {
                               if (
@@ -1967,7 +1851,6 @@ export default function AdminDashboardPage() {
                   })}
             </div>
           </Section>
-
           <Section title="Recent applicants">
             <ListCards
               isLoading={loansLoading}
@@ -1983,14 +1866,12 @@ export default function AdminDashboardPage() {
             />
           </Section>
         </div>
-
         {(loansError || kycError) && (
           <div className="text-center text-xs text-rose-600 pt-2">
             {loansError || kycError}
           </div>
         )}
       </main>
-
       <LoanPreviewModal
         loanId={viewLoanId}
         onClose={() => setViewLoanId(null)}
@@ -1999,7 +1880,6 @@ export default function AdminDashboardPage() {
     </div>
   );
 }
-
 /* =========================================================
    Loan Preview Modal (moves to processed on Accept/Decline)
    ========================================================= */
@@ -2022,7 +1902,6 @@ function LoanPreviewModal({
   const [busy, setBusy] = useState<"accept" | "decline" | "notify" | null>(null);
   const [notifyOpen, setNotifyOpen] = useState(false);
   const mounted = useRef(false);
-
   useEffect(() => {
     mounted.current = true;
     return () => {
@@ -2037,7 +1916,6 @@ function LoanPreviewModal({
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [loanId, onClose]);
-
   useEffect(() => {
     if (!loanId) return;
     (async () => {
@@ -2050,7 +1928,6 @@ function LoanPreviewModal({
         if (!loanSnap.exists()) throw new Error("Loan not found");
         const lr = { id: loanSnap.id, ...loanSnap.data() } as AnyRec;
         setLoanRaw(lr);
-
         let kycRaw: AnyRec | null = null;
         const kycId = detectKycId(lr);
         if (kycId) {
@@ -2062,13 +1939,11 @@ function LoanPreviewModal({
             // ignore
           }
         }
-
         const merged: AnyRec = { ...lr, kyc: kycRaw || {} };
-
         const first =
           (firstDefined(
             merged.firstName,
-            (merged as AnyRec)["applicantFirstName"],
+            merged["applicantFirstName"],
             merged.givenName,
             g(merged, "name.first"),
             g(merged, "applicant.name.first"),
@@ -2080,12 +1955,11 @@ function LoanPreviewModal({
           (typeof merged.name === "string"
             ? merged.name.split(/\s+/).slice(0, -1).join(" ")
             : undefined);
-
         const last =
           (firstDefined(
             merged.surname,
             merged.lastName,
-            (merged as AnyRec)["applicantLastName"],
+            merged["applicantLastName"],
             merged.familyName,
             g(merged, "name.last"),
             g(merged, "applicant.name.last"),
@@ -2098,18 +1972,16 @@ function LoanPreviewModal({
           (typeof merged.name === "string"
             ? merged.name.split(/\s+/).slice(-1)[0]
             : undefined);
-
         const applicantFull = [merged.title as string, first, last]
           .filter(Boolean)
           .join(" ") || "—";
-
         const mobile =
           (firstDefined(
-            (merged as AnyRec)["mobileTel"],
-            (merged as AnyRec)["mobileTel1"],
+            merged["mobileTel"],
+            merged["mobileTel1"],
             merged.mobile,
-            (merged as AnyRec)["phone"],
-            (merged as AnyRec)["phoneNumber"],
+            merged["phone"],
+            merged["phoneNumber"],
             g(merged, "contact.phone"),
             g(merged, "contact.mobile"),
             g(merged, "kyc.mobileTel1"),
@@ -2117,7 +1989,6 @@ function LoanPreviewModal({
             g(merged, "kyc.phone"),
             g(merged, "kyc.phoneNumber")
           ) as string | undefined) || "—";
-
         const email =
           (firstDefined(
             merged.email,
@@ -2125,7 +1996,6 @@ function LoanPreviewModal({
             g(merged, "kyc.email1"),
             g(merged, "kyc.email")
           ) as string | undefined) || "";
-
         const area =
           (firstDefined(
             merged.areaName,
@@ -2139,11 +2009,10 @@ function LoanPreviewModal({
             g(merged, "kyc.physicalCity"),
             g(merged, "kyc.areaName")
           ) as string | undefined) || "—";
-
         const rawStatus = firstDefined(
           merged.status,
-          (merged as AnyRec)["loanStatus"],
-          (merged as AnyRec)["applicationStatus"],
+          merged["loanStatus"],
+          merged["applicationStatus"],
           merged.state,
           g(merged, "kyc.status")
         );
@@ -2151,39 +2020,38 @@ function LoanPreviewModal({
           const s = typeof rawStatus === "string" ? rawStatus.toLowerCase() : rawStatus;
           if (s === "finished" || s === "complete" || s === "completed")
             return "closed";
-          return (s as string) || "pending";
+          return String(s) || "pending";
         })();
-
         const startRaw = firstDefined(
           merged.timestamp,
-          (merged as AnyRec)["startDate"],
-          (merged as AnyRec)["start_date"],
-          (merged as AnyRec)["createdAt"],
-          (merged as AnyRec)["created_at"],
+          merged["startDate"],
+          merged["start_date"],
+          merged["createdAt"],
+          merged["created_at"],
           g(merged, "kyc.timestamp"),
           g(merged, "kyc.createdAt")
         );
         const explicitEnd = firstDefined(
           merged.endDate,
-          (merged as AnyRec)["loanEndDate"],
-          (merged as AnyRec)["expectedEndDate"],
-          (merged as AnyRec)["maturityDate"],
-          (merged as AnyRec)["end_date"],
+          merged["loanEndDate"],
+          merged["expectedEndDate"],
+          merged["maturityDate"],
+          merged["end_date"],
           g(merged, "kyc.endDate")
         );
         let endMs = toMillis(explicitEnd);
         if (!endMs) {
           const periodRaw = firstDefined(
-            (merged as AnyRec)["loanPeriod"],
-            (merged as AnyRec)["period"],
-            (merged as AnyRec)["term"],
-            (merged as AnyRec)["tenorMonths"],
-            (merged as AnyRec)["tenorWeeks"]
+            merged["loanPeriod"],
+            merged["period"],
+            merged["term"],
+            merged["tenorMonths"],
+            merged["tenorWeeks"]
           );
           const freqRaw = firstDefined(
-            (merged as AnyRec)["paymentFrequency"],
-            (merged as AnyRec)["frequency"],
-            (merged as AnyRec)["repaymentFrequency"]
+            merged["paymentFrequency"],
+            merged["frequency"],
+            merged["repaymentFrequency"]
           );
           const freq = String(freqRaw || "monthly").toLowerCase() as
             | "weekly"
@@ -2191,7 +2059,6 @@ function LoanPreviewModal({
           const period = Number(periodRaw || 0);
           endMs = computeEndDate(startRaw, period, freq)?.getTime() ?? null;
         }
-
         const view: LoanPreview = {
           id: String(merged.id),
           applicantFull,
@@ -2199,50 +2066,47 @@ function LoanPreviewModal({
           email,
           status: status as string,
           area,
-          loanAmount: Number(firstDefined((merged as AnyRec)["loanAmount"], 0)),
+          loanAmount: Number(firstDefined(merged["loanAmount"], 0)),
           currentBalance: Number(
             firstDefined(
-              (merged as AnyRec)["currentBalance"],
-              (merged as AnyRec)["loanAmount"],
+              merged["currentBalance"],
+              merged["loanAmount"],
               0
             )
           ),
           period: Number(
             firstDefined(
-              (merged as AnyRec)["loanPeriod"],
-              (merged as AnyRec)["period"],
+              merged["loanPeriod"],
+              merged["period"],
               0
             )
           ),
           frequency: String(
             firstDefined(
-              (merged as AnyRec)["paymentFrequency"],
-              (merged as AnyRec)["frequency"],
+              merged["paymentFrequency"],
+              merged["frequency"],
               "monthly"
             )
           ).toLowerCase(),
           startMs: toMillis(startRaw),
           endMs: endMs || null,
-          collateralItems: Array.isArray((merged as AnyRec)["collateralItems"])
-            ? ((merged as AnyRec)["collateralItems"] as unknown[])
+          collateralItems: Array.isArray(merged["collateralItems"])
+            ? (merged["collateralItems"] as unknown[])
             : [],
         };
         if (mounted.current) setData(view);
-      } catch (e) {
+      } catch (e: unknown) {
         if (mounted.current) setErr(getErrorMessage(e));
       } finally {
         if (mounted.current) setLoading(false);
       }
     })();
   }, [loanId]);
-
   if (!loanId) return null;
-
   const endDate = data?.endMs ? new Date(data.endMs).toLocaleDateString() : "—";
   const startStr = data?.startMs
     ? new Date(data.startMs).toLocaleString()
     : "—";
-
   async function moveToProcessed(next: "approved" | "declined") {
     if (!loanId || !data) return;
     const busyKey: "accept" | "decline" = next === "approved" ? "accept" : "decline";
@@ -2253,7 +2117,6 @@ function LoanPreviewModal({
       } catch {
         // best-effort
       }
-
       const processedDoc: ProcessedLoan & Record<string, unknown> = {
         id: loanId,
         applicantFull: data.applicantFull || "—",
@@ -2271,22 +2134,19 @@ function LoanPreviewModal({
         original: loanRaw ?? {},
         cleared: false,
       };
-
       await setDoc(fsDoc(db, "processed_loans", loanId), processedDoc);
       await deleteDoc(fsDoc(db, "loan_applications", loanId));
-
       onFeedback(
         "success",
         `Loan ${next === "approved" ? "approved" : "declined"} and moved to Processed.`
       );
       onClose();
-    } catch (e) {
+    } catch (e: unknown) {
       onFeedback("error", `Failed to move to processed: ${getErrorMessage(e)}`);
     } finally {
       setBusy(null);
     }
   }
-
   return (
     <div className="fixed inset-0 z-40">
       <div className="absolute inset-0 bg-black/40" onClick={onClose} />
@@ -2301,7 +2161,6 @@ function LoanPreviewModal({
               Close
             </button>
           </div>
-
           <div className="p-4">
             {loading && <SkeletonLine count={6} />}
             {err && (
@@ -2329,7 +2188,6 @@ function LoanPreviewModal({
                 />
                 <KV label="Start" value={startStr} />
                 <KV label="End" value={endDate} />
-
                 {Array.isArray(data.collateralItems) &&
                   data.collateralItems.length > 0 && (
                     <div>
@@ -2346,10 +2204,12 @@ function LoanPreviewModal({
                               style={{ borderColor: color, color }}
                             >
                               {thumb ? (
-                                <img
+                                <Image
                                   src={thumb}
                                   alt=""
-                                  className="h-5 w-5 rounded object-cover"
+                                  width={20}
+                                  height={20}
+                                  className="rounded object-cover"
                                 />
                               ) : null}
                               {label}
@@ -2388,14 +2248,12 @@ function LoanPreviewModal({
                 Notify
               </button>
             </div>
-
             <button onClick={onClose} className="inline-flex items-center rounded-lg bg-green-600 text-white border px-3 py-1.5 text-sm hover:bg-green-700">
               Done
             </button>
           </div>
         </div>
       </div>
-
       {/* Notify modal */}
       {notifyOpen && data && (
         <NotifyEmailModal
@@ -2409,7 +2267,6 @@ function LoanPreviewModal({
     </div>
   );
 }
-
 /* =========================================================
    NotifyEmailModal (EmailJS)
    ========================================================= */
@@ -2423,7 +2280,6 @@ function NotifyEmailModal({
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [ok, setOk] = useState(false);
-
   async function sendEmail(e: React.FormEvent) {
     e.preventDefault();
     setError(null); setOk(false);
@@ -2433,7 +2289,6 @@ function NotifyEmailModal({
     if (!toEmail) { setError("Recipient email is required."); return; }
     if (!subject) { setError("Subject is required."); return; }
     if (!message) { setError("Message is required."); return; }
-
     setSending(true);
     try {
       await emailjs.send(
@@ -2443,11 +2298,10 @@ function NotifyEmailModal({
         { publicKey: EMAILJS_PUBLIC_KEY }
       );
       setOk(true);
-    } catch (e: any) {
-      setError(e?.text || e?.message || "Failed to send email.");
+    } catch (e: unknown) {
+      setError(getErrorMessage(e));
     } finally { setSending(false); }
   }
-
   return (
     <div className="fixed inset-0 z-50">
       <div className="absolute inset-0 bg-black/40" onClick={onClose} />
@@ -2460,7 +2314,6 @@ function NotifyEmailModal({
           <div className="p-4 grid gap-3">
             {ok && <div className="rounded-md bg-emerald-50 border border-emerald-200 text-emerald-800 text-sm px-3 py-2">Email sent successfully.</div>}
             {error && <div className="rounded-md bg-rose-50 border border-rose-200 text-rose-800 text-sm px-3 py-2">{error}</div>}
-
             <label className="grid gap-1 text-sm">
               <span className="text-slate-700">To (email)</span>
               <input
@@ -2472,23 +2325,19 @@ function NotifyEmailModal({
                 required
               />
             </label>
-
             <label className="grid gap-1 text-sm">
               <span className="text-slate-700">Recipient name</span>
               <input value={toName} onChange={(e) => setToName(e.target.value)} type="text" className="rounded-lg border px-3 py-2 placeholder:text-black placeholder:opacity-100" placeholder="Client name" />
             </label>
-
             <label className="grid gap-1 text-sm">
               <span className="text-slate-700">Subject</span>
               <input value={subject} onChange={(e) => setSubject(e.target.value)} type="text" className="rounded-lg border px-3 py-2 placeholder:text-black placeholder:opacity-100" placeholder="e.g. Update on your ESSA loan" required />
             </label>
-
             <label className="grid gap-1 text-sm">
               <span className="text-slate-700">Message</span>
               <textarea value={message} onChange={(e) => setMessage(e.target.value)} rows={6} className="rounded-lg border px-3 py-2 placeholder:text-black placeholder:opacity-100" placeholder="Type your message…" required />
             </label>
           </div>
-
           <div className="p-4 border-t flex items-center justify-end gap-2">
             <Button onClick={onClose} variant="danger">Cancel</Button>
             <button type="submit" disabled={sending} className="rounded-lg bg-blue-600 text-white px-3 py-1.5 text-sm hover:bg-blue-700 disabled:opacity-60">
@@ -2500,7 +2349,6 @@ function NotifyEmailModal({
     </div>
   );
 }
-
 function Button({ onClick, children, variant = "default" }: { onClick?: () => void; children: React.ReactNode; variant?: "default" | "danger" }) {
   const cls = variant === "danger"
     ? "rounded-lg bg-red-600 text-white border px-3 py-1.5 text-sm hover:bg-red-700"
@@ -2511,16 +2359,14 @@ function Button({ onClick, children, variant = "default" }: { onClick?: () => vo
     </button>
   );
 }
-
 /* =========================================================
    KYC Preview Modal (includes ID/selfie images)
    ========================================================= */
 function KycPreviewModal({ kycId, onClose }: { kycId: string | null; onClose: () => void; }) {
-  const [data, setData] = useState<any>(null);
+  const [data, setData] = useState<AnyRec | null>(null);
   const [isLoading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const mounted = useRef(false);
-
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
   useEffect(() => {
     if (!kycId) return;
@@ -2528,7 +2374,6 @@ function KycPreviewModal({ kycId, onClose }: { kycId: string | null; onClose: ()
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [kycId, onClose]);
-
   useEffect(() => {
     if (!kycId) return;
     setLoading(true); setErr(null); setData(null);
@@ -2539,20 +2384,17 @@ function KycPreviewModal({ kycId, onClose }: { kycId: string | null; onClose: ()
         if (!snap.exists()) throw new Error("Record not found");
         setData({ id: snap.id, ...snap.data() });
         setLoading(false);
-      } catch (e: any) {
+      } catch (e: unknown) {
         if (!mounted.current) return;
-        setErr(e?.message || "Failed to load KYC");
+        setErr(getErrorMessage(e));
         setLoading(false);
       }
     })();
   }, [kycId]);
-
   if (!kycId) return null;
-
-  const idFront = toDataUrlMaybe(data?.idFrontImageBase64);
-  const idBack = toDataUrlMaybe(data?.idBackImageBase64);
-  const selfie = toDataUrlMaybe(data?.selfieImageBase64);
-
+  const idFront = toDataUrlMaybe(asString(data?.idFrontImageBase64));
+  const idBack = toDataUrlMaybe(asString(data?.idBackImageBase64));
+  const selfie = toDataUrlMaybe(asString(data?.selfieImageBase64));
   return (
     <div className="fixed inset-0 z-40">
       <div className="absolute inset-0 bg-black/40" onClick={onClose} />
@@ -2571,28 +2413,27 @@ function KycPreviewModal({ kycId, onClose }: { kycId: string | null; onClose: ()
                   label="Name"
                   value={[data?.title, data?.firstName ?? data?.applicantFirstName, data?.lastName ?? data?.surname ?? data?.applicantLastName].filter(Boolean).join(" ") || "—"}
                 />
-                <KV label="ID Number" value={data?.idNumber || "—"} />
-                <KV label="Gender" value={data?.gender || "—"} />
+                <KV label="ID Number" value={String(data?.idNumber || "—")} />
+                <KV label="Gender" value={String(data?.gender || "—")} />
                 <KV label="Date of Birth" value={fmtMaybeDate(data?.dateOfBirth)} />
-                <KV label="Email" value={data?.email1 || data?.email || "—"} />
-                <KV label="Mobile" value={data?.mobileTel1 || data?.mobile || "—"} />
-                <KV label="Address / City" value={data?.physicalAddress || data?.physicalCity || data?.areaName || "—"} />
-                <KV label="Employer" value={data?.employer || "—"} />
+                <KV label="Email" value={String(data?.email1 || data?.email || "—")} />
+                <KV label="Mobile" value={String(data?.mobileTel1 || data?.mobile || "—")} />
+                <KV label="Address / City" value={String(data?.physicalAddress || data?.physicalCity || data?.areaName || "—")} />
+                <KV label="Employer" value={String(data?.employer || "—")} />
                 <KV label="Dependants" value={String(data?.dependants ?? "—")} />
                 <KV label="Next of Kin" value={`${data?.familyName || "—"} (${data?.familyRelation || "—"})${data?.familyMobile ? " · " + data?.familyMobile : ""}`} />
-
                 {(idFront || idBack || selfie) && (
                   <div className="mt-2">
                     <div className="text-slate-500 mb-1">Identity Images</div>
                     <div className="grid grid-cols-3 gap-2">
-                      <div className="rounded-md border bg-slate-50 overflow-hidden min-h-[80px] grid place-items-center">
-                        {idFront ? <img src={idFront} alt="ID Front" className="w-full h-full object-cover" /> : <span className="text-xs text-slate-500 p-2">ID Front not available</span>}
+                      <div className="relative rounded-md border bg-slate-50 overflow-hidden min-h-[80px] grid place-items-center">
+                        {idFront ? <Image src={idFront} alt="ID Front" fill className="object-cover" /> : <span className="text-xs text-slate-500 p-2">ID Front not available</span>}
                       </div>
-                      <div className="rounded-md border bg-slate-50 overflow-hidden min-h-[80px] grid place-items-center">
-                        {idBack ? <img src={idBack} alt="ID Back" className="w-full h-full object-cover" /> : <span className="text-xs text-slate-500 p-2">ID Back not available</span>}
+                      <div className="relative rounded-md border bg-slate-50 overflow-hidden min-h-[80px] grid place-items-center">
+                        {idBack ? <Image src={idBack} alt="ID Back" fill className="object-cover" /> : <span className="text-xs text-slate-500 p-2">ID Back not available</span>}
                       </div>
-                      <div className="rounded-md border bg-slate-50 overflow-hidden min-h-[80px] grid place-items-center">
-                        {selfie ? <img src={selfie} alt="Selfie" className="w-full h-full object-cover" /> : <span className="text-xs text-slate-500 p-2">Selfie not available</span>}
+                      <div className="relative rounded-md border bg-slate-50 overflow-hidden min-h-[80px] grid place-items-center">
+                        {selfie ? <Image src={selfie} alt="Selfie" fill className="object-cover" /> : <span className="text-xs text-slate-500 p-2">Selfie not available</span>}
                       </div>
                     </div>
                   </div>
@@ -2610,7 +2451,6 @@ function KycPreviewModal({ kycId, onClose }: { kycId: string | null; onClose: ()
     </div>
   );
 }
-
 /* =========================================================
    UI bits
    ========================================================= */
@@ -2636,7 +2476,6 @@ function KPICard({
     </div>
   );
 }
-
 function Section({ title, extra, children, className }: { title: React.ReactNode; extra?: React.ReactNode; children: React.ReactNode; className?: string; }) {
   return (
     <section className={`rounded-2xl border bg-white p-4 sm:p-5 ${className || ""}`}>
@@ -2648,7 +2487,6 @@ function Section({ title, extra, children, className }: { title: React.ReactNode
     </section>
   );
 }
-
 function ResponsiveTable({ isLoading, emptyText, headers, rows }: { isLoading: boolean; emptyText: string; headers: string[]; rows: React.ReactNode[][]; }) {
   return (
     <>
@@ -2677,7 +2515,6 @@ function ResponsiveTable({ isLoading, emptyText, headers, rows }: { isLoading: b
     </>
   );
 }
-
 function ListCards({
   isLoading, emptyText, items,
 }: {
@@ -2725,7 +2562,6 @@ function ListCards({
     </div>
   );
 }
-
 function CellPrimary({ title, subtitle }: { title: string; subtitle?: string }) {
   return (
     <div>
@@ -2734,7 +2570,6 @@ function CellPrimary({ title, subtitle }: { title: string; subtitle?: string }) 
     </div>
   );
 }
-
 function MiniDonut({ isLoading, data, centerLabel }: { isLoading: boolean; data: Array<{ label: string; value: number; color: string }>; centerLabel: string; }) {
   const total = Math.max(1, data.reduce((s, d) => s + d.value, 0));
   const css = conicCSS(data);
@@ -2753,7 +2588,6 @@ function MiniDonut({ isLoading, data, centerLabel }: { isLoading: boolean; data:
     </div>
   );
 }
-
 function Legend({ items }: { items: Array<[string, number]> }) {
   if (!items || items.length === 0) return null;
   const total = items.reduce((s, [, v]) => s + v, 0);
@@ -2772,7 +2606,6 @@ function Legend({ items }: { items: Array<[string, number]> }) {
     </ul>
   );
 }
-
 function BarRow({ label, value, total }: { label: string; value: number; total: number }) {
   const pct = total > 0 ? Math.round((value / total) * 100) : 0;
   return (
@@ -2787,7 +2620,6 @@ function BarRow({ label, value, total }: { label: string; value: number; total: 
     </div>
   );
 }
-
 function SkeletonLine({ count = 3 }: { count?: number }) {
   return (
     <div className="grid gap-2">
@@ -2795,7 +2627,6 @@ function SkeletonLine({ count = 3 }: { count?: number }) {
     </div>
   );
 }
-
 function KV({ label, value }: { label: string; value: React.ReactNode }) {
   return (
     <div className="flex items-start gap-3">
@@ -2804,7 +2635,6 @@ function KV({ label, value }: { label: string; value: React.ReactNode }) {
     </div>
   );
 }
-
 /* ===== Icons (inline, no deps) ===== */
 function IconRefresh(props: React.SVGProps<SVGSVGElement>) { return (<svg viewBox="0 0 24 24" fill="none" {...props}><path d="M4 4v6h6M20 20v-6h-6M20 10a8 8 0 0 0-14.9-3M4 14a8 8 0 0 0 14.9 3" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/></svg>); }
 function IconClipboard(props: React.SVGProps<SVGSVGElement>) { return (<svg viewBox="0 0 24 24" fill="none" {...props}><rect x="6" y="4" width="12" height="16" rx="2" stroke="currentColor" strokeWidth="2"/><path d="M9 4h6v2H9z" fill="currentColor"/></svg>); }

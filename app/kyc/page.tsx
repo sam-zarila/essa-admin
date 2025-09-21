@@ -72,10 +72,10 @@ export default function KycListPage() {
     localStorage.setItem("kycLastSeen", String(ts));
     setUnseen(0);
   }
-
+type Nameish = { title?: string; firstName?: string; lastName?: string };
   // Pretty name + fallbacks
-  const displayName = (k: any) =>
-    [k.title, k.firstName, k.lastName].filter(Boolean).join(" ") || "—";
+ const displayName = (k: Partial<Nameish> | null | undefined) =>
+  [k?.title, k?.firstName, k?.lastName].filter(Boolean).join(" ") || "—";
 
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 py-6">
@@ -123,7 +123,7 @@ export default function KycListPage() {
                 <tr><td className="p-6 text-center text-slate-500" colSpan={7}>Loading…</td></tr>
               )}
               {error && (
-                <tr><td className="p-6 text-center text-rose-600" colSpan={7}>{String((error as any).message || "Error")}</td></tr>
+                <tr><td className="p-6 text-center text-rose-600" colSpan={7}>{String((error).message || "Error")}</td></tr>
               )}
               {!isLoading && !error && items.length === 0 && (
                 <tr><td className="p-6 text-center text-slate-500" colSpan={7}>No KYC records.</td></tr>
@@ -153,7 +153,7 @@ export default function KycListPage() {
         {/* Mobile list */}
         <div className="md:hidden divide-y">
           {isLoading && <div className="p-4 text-center text-slate-500">Loading…</div>}
-          {error && <div className="p-4 text-center text-rose-600">{String((error as any).message || "Error")}</div>}
+          {error && <div className="p-4 text-center text-rose-600">{String((error).message || "Error")}</div>}
           {!isLoading && !error && items.length === 0 && (
             <div className="p-4 text-center text-slate-500">No KYC records.</div>
           )}

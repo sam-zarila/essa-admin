@@ -5,6 +5,14 @@ import { NextRequest, NextResponse } from "next/server";
 import { adminDb } from "@/app/lib/firebase-admin";
 
 export async function GET(req: NextRequest) {
+  function getErrorMessage(error: unknown): string | undefined {
+  if (error instanceof Error) return error.message;
+  if (typeof error === "string") return error;
+  if (error && typeof error === "object" && "message" in error) {
+    return String(error.message);
+  }
+  return undefined;
+}
   try {
     const db = adminDb();
 
@@ -30,7 +38,7 @@ export async function GET(req: NextRequest) {
     const sortField = hasCreatedAt ? "createdAt" : "timestamp";
 
     // IMPORTANT: type q as a Query so .orderBy() reassignment is valid
-    let q: FirebaseFirestore.Query<FirebaseFirestore.DocumentData> = col.orderBy(
+    const q: FirebaseFirestore.Query<FirebaseFirestore.DocumentData> = col.orderBy(
       sortField as string,
       "desc"
     );
@@ -38,7 +46,7 @@ export async function GET(req: NextRequest) {
     const snap = await q.limit(limit).get();
 
     const items = snap.docs.map((d) => {
-      const v = d.data() as any;
+      const v = d.data() ;
       const createdAt =
         v?.createdAt?.toMillis?.() ??
         v?.timestamp?.toMillis?.() ??
@@ -57,11 +65,12 @@ export async function GET(req: NextRequest) {
     });
 
     return NextResponse.json({ items, updatedAt: Date.now() });
-  } catch (err: any) {
-    console.error("[/api/admin/kyc] fatal:", err);
-    return NextResponse.json(
-      { error: err?.message || "internal-error" },
-      { status: 500 }
-    );
-  }
+ } catch (err: unknown) {
+  console.error("[/api/admin/kyc] fatal:", err);
+  const message = getErrorMessage(err) || "internal-error";
+  return NextResponse.json(
+    { error: message },
+    { status: 500 }
+  );
+}
 }

@@ -23,6 +23,7 @@ export async function GET(
 
     return NextResponse.json({ id: doc.id, ...doc.data() });
   } catch (err) {
+    console.error("[/api/admin/kyc/[id]] failed:", err);
     return NextResponse.json({ error: "Server error" }, { status: 500 });
   }
 }

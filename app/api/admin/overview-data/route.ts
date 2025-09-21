@@ -28,9 +28,39 @@ type KycDoc = {
   timestamp?: admin.firestore.Timestamp | null;
 };
 
-function toMillis(v: any): number | null {
-  try { return v?.toMillis?.() ?? null; } catch { return null; }
+/* ---- toMillis: remove `any`, keep behavior ---- */
+type HasToMillis = { toMillis?: () => number };
+type HasToDate = { toDate?: () => Date };
+
+function toMillis(v: unknown): number | null {
+  try {
+    if (v == null) return null;
+
+    // Prefer native toMillis() if exposed (admin.firestore.Timestamp has it)
+    if (typeof (v as HasToMillis).toMillis === "function") {
+      const n = (v as HasToMillis).toMillis!();
+      return Number.isFinite(n) ? n : null;
+    }
+
+    // Fall back to toDate() (for client Timestamp)
+    if (typeof (v as HasToDate).toDate === "function") {
+      const d = (v as HasToDate).toDate!();
+      return d instanceof Date ? d.getTime() : null;
+    }
+
+    // Also accept primitives and ISO strings if ever passed through
+    if (v instanceof Date) return v.getTime();
+    if (typeof v === "number") return Number.isFinite(v) ? v : null;
+    if (typeof v === "string") {
+      const n = Date.parse(v);
+      return Number.isFinite(n) ? n : null;
+    }
+  } catch {
+    // ignore
+  }
+  return null;
 }
+
 function computeEndDate(
   ts: admin.firestore.Timestamp | null | undefined,
   period: number | undefined,
@@ -208,11 +238,8 @@ export async function GET() {
       breakdown,
       updatedAt: Date.now(),
     });
-  } catch (err: any) {
-    console.error("[/api/admin/overview-data] fatal:", err);
-    return NextResponse.json(
-      { error: err?.message || "internal-error" },
-      { status: 500 }
-    );
+  } catch (err) {
+    console.error("[/api/admin/kyc/[id]] failed:", err);
+    return NextResponse.json({ error: "internal-error" }, { status: 500 });
   }
 }

@@ -5,7 +5,6 @@ import path from "path";
 
 // Keep a single app instance in dev/hot-reload
 declare global {
-  // eslint-disable-next-line no-var
   var __FIREBASE_ADMIN__: admin.app.App | undefined;
 }
 
@@ -13,7 +12,7 @@ type ServiceAccountJson = {
   project_id: string;
   client_email: string;
   private_key: string;
-  // other fields are fine, we only require the three above
+
 };
 
 function loadServiceAccount(): ServiceAccountJson {
