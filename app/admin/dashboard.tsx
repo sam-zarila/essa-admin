@@ -578,7 +578,7 @@ export default function AdminDashboardPage() {
       setLoggingOut(true);
       await signOut(auth);
       // redirect to login (adjust path if your login route differs)
-      window.location.href = "/login";
+      window.location.href = "/auth";
     } catch (e) {
       setLoggingOut(false);
       pushFeedback("error", `Failed to sign out: ${getErrorMessage(e)}`);
