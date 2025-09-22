@@ -1,4 +1,5 @@
 "use client";
+
 import { useEffect, useMemo, useRef, useState } from "react";
 import type React from "react";
 import Link from "next/link";
@@ -20,7 +21,8 @@ import {
   serverTimestamp,
 } from "firebase/firestore";
 import emailjs from "@emailjs/browser";
-import { db } from "../lib/firebase";
+import { db, auth } from "../lib/firebase"; // ← make sure your ../lib/firebase exports both `db` and `auth`
+import { signOut } from "firebase/auth";
 
 /* EmailJS config (env or replace placeholders) */
 const EMAILJS_SERVICE_ID =
@@ -569,6 +571,20 @@ export default function AdminDashboardPage() {
     window.setTimeout(() => setFeedback(null), 4000);
   }
 
+  /* ===== Logout button state & handler ===== */
+  const [loggingOut, setLoggingOut] = useState(false);
+  async function handleLogout() {
+    try {
+      setLoggingOut(true);
+      await signOut(auth);
+      // redirect to login (adjust path if your login route differs)
+      window.location.href = "/login";
+    } catch (e) {
+      setLoggingOut(false);
+      pushFeedback("error", `Failed to sign out: ${getErrorMessage(e)}`);
+    }
+  }
+
   /* Loans (active) */
   const [loansRaw, setLoansRaw] = useState<Loan[]>([]);
   const [loansLoading, setLoansLoading] = useState(true);
@@ -629,15 +645,10 @@ export default function AdminDashboardPage() {
             surname: last ?? "",
             title: asString(v.title) ?? "",
             mobile:
-              (asString((v as AnyRec)["mobileTel"]) ??
-                asString(v.mobile) ??
-                asString((v as AnyRec)["mobileTel1"]) ??
-                "") || "",
+              (asString((v as AnyRec)["mobileTel"]) ?? asString(v.mobile) ?? asString((v as AnyRec)["mobileTel1"]) ?? "") || "",
             loanAmount: Number((v as AnyRec)["loanAmount"] ?? 0),
             currentBalance: Number(
-              (v as AnyRec)["currentBalance"] ??
-                (v as AnyRec)["loanAmount"] ??
-                0
+              (v as AnyRec)["currentBalance"] ?? (v as AnyRec)["loanAmount"] ?? 0
             ),
             loanPeriod,
             paymentFrequency,
@@ -1367,11 +1378,20 @@ export default function AdminDashboardPage() {
           <div className="flex items-center gap-2">
             <button
               onClick={() => setUpdatedAt(Date.now())}
-              className="inline-flex items-center gap-2 rounded-lg border px-3 py-1.5 text-sm hover:bg-slate-50"
+              className="inline-flex items-center bg-gradient-to-br from-blue-600 to-indigo-600 text-white gap-2 rounded-lg px-3 py-1.5 text-sm"
               title="Refresh"
             >
               <IconRefresh className="h-4 w-4" />
               Refresh
+            </button>
+            {/* Logout button */}
+            <button
+              onClick={handleLogout}
+              disabled={loggingOut}
+              className="inline-flex items-center gap-2 rounded-lg bg-red-500 border px-3 py-1.5 text-sm hover:bg-slate-50 disabled:opacity-60"
+              title="Sign out"
+            >
+              {loggingOut ? "Signing out…" : "Log out"}
             </button>
           </div>
         </div>
@@ -1491,7 +1511,7 @@ export default function AdminDashboardPage() {
             <div className="flex items-center gap-2">
               <Link
                 href="/admin/outstanding"
-                className="rounded-lg border px-2.5 py-1.5 text-xs hover:bg-slate-50"
+                className="rounded-lg border border-blue-600 bg-blue-500  px-2.5 py-1.5 text-xs hover:bg-blue-100"
               >
                 Open Outstanding
               </Link>
